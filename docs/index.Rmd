@@ -42,17 +42,18 @@ We developed a system to integrate transcriptomic responses with contaminant con
 
 </br>
 
+
+#### These models can be used to determine    
+* If either PCB or PAH exposure can explain biological effects.      
+* If the remediation decreased both measured PCB concentrations and predicted PCB effective concentrations, i.e., biological effects.     
+
 ```{r remediation and site mixture prediction, fig.show="hold", out.width="50%", fig.height=8, echo=FALSE}
 model_site_regression_all <- readRDS("Fig_model_site_regression_all.rds")
 model_site_regression_all
 yyplot.bysite.remediation <- readRDS("Fig_yyplot.bysite.remediation.rds")
 yyplot.bysite.remediation
 ```
-Lasso regression models were established to predict PCB or PAH concentrations. And the predicted and measured PCB concentration at Waukegan harbor were plotted by year, before and after remediation. 
+I used Lasso linear regression models to predict PCB or PAH concentrations. And the predicted and measured PCB concentration at Waukegan harbor were plotted by year, before and after remediation.
 
 </br>
-
-#### These models can used to determine  
-* If biological effects can be explained by either PCB or PAH exposure   
-* If the predicted effect PCB concentrations after remediation attenuated with measured PCB concentrations.  
 
