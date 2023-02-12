@@ -1,0 +1,25 @@
+---
+title: 'Integrated analysis and modelling of contaminant mixtures and transcriptomic responses in Tree Swallow (Tachycineta bicolor) nestlings in the Great Lakes'
+output:
+  html_document:
+    df_print: paged
+    theme: cerulean
+---
+
+**Chi Yen Tseng^1^**, Christine M. Custer^2^, Thomas W. Custer^2^, Paul M. Dummer^2^, Natalie Karouna‐Renier^3^ and Cole W. Matson^1^
+
+1. Department of Environmental Science, The Institute of Ecological, Earth, and Environmental Sciences (TIE3S), and the Center for Reservoir and Aquatic Systems Research (CRASR), Baylor University, Waco, Texas 76798, United States 
+2. Upper Midwest Environmental Sciences Center, U.S. Geological Survey, La Crosse, Wisconsin 54603, United States 
+3. U.S. Geological Survey, Eastern Ecological Science Center (EESC) at Patuxent, Beltsville, Maryland 20705, United States
+
+Any use of trade, product, or firm names is for descriptive purposes only and does not imply endorsement by the U.S. Government.
+</br>
+
+## Documents included
+
+1. [Supplementary document 1](GLRI_MS2_supplementary1.html) describes RNA-Seq processing procedures, parameter, and scripts.  
+2. [Supplementary document 2](GLRI_MS2_compile.html) includes all the R scripts to ensure the reproducible results of regression, lasso models, and data visualization.  
+3. [Supplementary document 2.2](GLRI_MS2_FirstRound_lasso.html) includes R scripts for first round of lasso regression analysis   
+
+
+![All the GLRI sampling sites](GLRI_site_map.png)  

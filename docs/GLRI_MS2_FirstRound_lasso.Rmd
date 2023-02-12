@@ -1,0 +1,461 @@
+---
+title: "Integrated analysis and modelling of contaminant mixtures and transcriptomic responses in Tree Swallow (Tachycineta bicolor) nestlings in the Great Lakes"
+output:
+  html_document:
+    df_print: paged
+    theme: cerulean
+    code_download: true
+---
+
+Chi Yen Tseng^1^, Christine M. Custer^2^, Thomas W. Custer^2^, Paul M. Dummer^2^, Natalie Karouna‐Renier^3^ and Cole W. Matson^1^
+
+1. Department of Environmental Science, The Institute of Ecological, Earth, and Environmental Sciences (TIE3S), and the Center for Reservoir and Aquatic Systems Research (CRASR), Baylor University, Waco, Texas 76798, United States 
+2. Upper Midwest Environmental Sciences Center, U.S. Geological Survey, La Crosse, Wisconsin 54603, United States 
+3. U.S. Geological Survey, Eastern Ecological Science Center (EESC) at Patuxent, Beltsville, Maryland 20705, United States
+
+
+### Load packages 
+```{r Load packages, eval=FALSE}
+library(glmnet)
+library(edgeR)
+library(readr)
+library(tidyverse)
+library(foreach)
+library(doParallel)
+library(DESeq2)
+```
+
+
+```{css, echo=FALSE}
+pre {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+pre[class] {
+  max-height: 150px;
+}
+```
+
+## 1. For selecting top predictor genes to predcit PCBs (by individual nestlings)  
+
+### Load all data 
+
+`GLRI_coldata`  
+: chemistry data ("Dioxin" "MultiRedsiduePest" "PAHs" "PBDEs" "LRPCBs" "HRPCBs" "Pesticides" "PFCs" "PPCPs")  
+
+`data.contaminants.majorSubset.geo.bysite`
+: geometric mean of each contaminant key by site  
+
+`contaminants.coldata.subset`
+: only includes the nestlings with genomic information and removes PAHs data  
+
+`ID.convert`
+: gene ID convertion table between tree swallow gene pseudo name and chicken gene name  
+
+`siteMAP.all`
+: site ID and propersite name convertion Table  
+
+`dds.bothSex.adjusted or counts.tswallow`
+: normalized count matrix for all nestlings, adjusted for batch difference  
+
+`Cont.major.list`
+: major contaminants ("Nonachlor, cis-_C", "Heptachlor Epoxide_C",   "Nonachlor, trans-_C",  "PFDA_C", "Chlordane, oxy-_C", "Total Parent PAHs", "Total PBDE", "Total PAHs","Total PCBs","Total_PFCs")
+
+`counts.tswallow.norm`
+: vst transformed normalized counts   
+
+```{r Load data, eval=FALSE}
+setwd("/home/chiyen/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all")
+# load chemistry data and show class
+GLRI_coldata <- readRDS("GLRI_coldata_to2020.rds")
+print(c("chemistry data class:", unique(GLRI_coldata$class)))
+# Determine min contamin value for each Key
+GLRI_coldata <- GLRI_coldata$contaminants %>% filter(!is.na(Value))
+# Load chemistry GeoMean by site 
+data.contaminants.majorSubset.geo.bysite <- readRDS("data_contaminants_majorSubset_geo_bysite.rds")
+# Determine minimum conc. for each chemical 
+contaminants.min.adjusted <- GLRI_coldata %>% group_by(Key,class) %>% summarise(minValue = min(as.numeric(value.adjust),na.rm = TRUE)) %>% ungroup()
+# Editing chmistry geoMean by substituting "." (below detection limit)  into t1/3 of min of that chemistry 
+contaminants.coldata.subset <- read_csv("GLRI_TRES_contaminantsto2020_Transcriptome_subset_CT.csv")
+contaminants.coldata.subset <- contaminants.coldata.subset %>% filter(!is.na(Value)) ## remove those with only NA
+contaminants.coldata.subset <- contaminants.coldata.subset %>% left_join(contaminants.min.adjusted, by = c("Key","class"))
+contaminants.coldata.subset <- contaminants.coldata.subset %>% filter(!minValue == "Inf") ## remove those with only "."
+contaminants.coldata.subset$value.adjust[contaminants.coldata.subset$Value == "."] <- contaminants.coldata.subset$minValue[contaminants.coldata.subset$Value == "."]/3 # "." converts to 1/3 of loweast detetable value
+# Load Gene ID MAP for GeneID to GeneName conversion
+ID.convert <- readRDS("IDmap_final.rds") ## gene ID Convert table
+siteMAP.all <- as_tibble(readRDS("siteMAP_all.rds")) ## site ID convert Table
+siteMAP.all$SiteID[siteMAP.all$propersite == "StarLake"] <- "SL"
+dds.bothSex.adjusted <- readRDS("dds.bothSex.adjusted.outlierRM.rds") ## normalized count matrix
+dds.bothSex.adjusted <- dds.bothSex.adjusted[,colnames(dds.bothSex.adjusted) != "19HW576B"] ## remove "19HW576B" only use A chick for the analysis for regression analysis
+colnames(dds.bothSex.adjusted) <- gsub("A$|B$", "", colnames(dds.bothSex.adjusted)) ## remove all the A or B tail 
+dds.bothSex.adjusted$propersite2 <- as.character(siteMAP.all$propersite[match(dds.bothSex.adjusted$site, siteMAP.all$SiteID)]) 
+counts.tswallow <- assay(dds.bothSex.adjusted)
+Cont.major.list <- c("Nonachlor, cis-_C", "Heptachlor Epoxide_C",   "Nonachlor, trans-_C",  "PFDA_C", "Chlordane, oxy-_C", "Total Parent PAHs", "Total PBDE", "Total PAHs","Total PCBs","Total_PFCs")
+## contaminants.coldata.subset2: There are some PCBs are LRPCBs, some are HRPCBs. Combining all of  "TOTAL PCBs_C", and "TOTAL PCBs" into "TOTAL PCBs" and if there are overlapping, pick LRPCBs first 
+contaminants.coldata.subset <- contaminants.coldata.subset %>% filter(class != "PAHs")
+contaminants.coldata.subset <- contaminants.coldata.subset %>% mutate(MergeSite=replace(MergeSite, MergeSite == "ref", "SL")) ## replace ref to SL 
+contaminants.coldata.subset$MergeID <- gsub("-","", contaminants.coldata.subset$MergeID) ## remove all dash
+contaminants.coldata.subset$MergeID <- gsub("A$","", contaminants.coldata.subset$MergeID) ## remove A tail
+contaminants.coldata.subset <- contaminants.coldata.subset %>% mutate(Key=replace(Key, Key == "TOTAL PCBs_C" | Key == "TOTAL PCBs", "TOTAL PCBs"))
+counts.tswallow.norm <- vst(dds.bothSex.adjusted)
+counts.tswallow.norm <- assay(counts.tswallow.norm)
+```
+#### Load self-defined functions for PCB training
+
+GetTopDEGs_byGeoMean.byNest(Con,Con_ind)
+: get DEGs (p < 0.05) and select top 1000 most differentiating genes using EdgeR against PCBs tissue concentrations  
+
+Run_lasso.onesiteout(n, Con, Con_ind, s, lam.m)
+: Run leave-one-out (by site) cross validation and train lasso regression against PCBs tissue concentrations; 31 sites, sample n out of  31*300 re-sampling  
+
+
+```{r Load self-defined functions for PCB training, eval = FALSE}
+GetTopDEGs_byGeoMean.byNest <- function(Con,Con_ind) {
+  nestid <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(MergeID)
+  match1 <- colnames(counts.tswallow) %in% nestid
+  counts.con  <-  counts.tswallow[,match1]
+  counts.con.batch <- as.factor(as.character(dds.bothSex.adjusted$batch2)[match1])
+  counts.con.sex <- as.factor(as.character(dds.bothSex.adjusted$sex)[match1])
+  contamin.matrix <- contaminants.coldata.subset2 %>% dplyr::slice(match(colnames(counts.con), contaminants.coldata.subset2$MergeID)) %>% filter(Key == Con_ind)
+  counts.con.contamin <- log10(contamin.matrix$value.adjust) ## get log10 value to suppress potential outlier
+  ## EdgeR needs non-normalized counts
+  y <- DGEList(counts=as.matrix(counts.con))
+  y <- calcNormFactors(y)
+  if (length(levels(counts.con.batch)) > 1) {
+    design <- model.matrix(~counts.con.batch+counts.con.sex+counts.con.contamin) ## add batch as cofactor
+    y <- estimateDisp(y,design)
+    fit <- glmQLFit(y,design)
+    qlf <- glmQLFTest(fit, coef=4)} else {
+      design <- model.matrix(~counts.con.sex+counts.con.contamin) ## add batch as cofactor
+      y <- estimateDisp(y,design)
+      fit <- glmQLFit(y,design) 
+      qlf <- glmQLFTest(fit, coef=3)
+    }
+  DEGs.Q <- sum(decideTests(qlf) != 0)
+  print(DEGs.Q)
+  match2 <- row.names(topTags(qlf, n=1000))
+  match2.logFC <- topTags(qlf, n=1000)[[1]][,"logFC"]
+  match2.table <- topTags(qlf, n=2000)
+  match2.table.all <- topTags(qlf, n=nrow(qlf))
+  match2.DEGs.table <- topTags(qlf, n=DEGs.Q)
+  assign(paste0("DEGs.table_by_GeoMeanNest.",Con,Con_ind),match2.DEGs.table, envir = parent.frame())
+  assign(paste0("top1000DEGs_by_GeoMeanNest.",Con,Con_ind),match2, envir = parent.frame())
+  assign(paste0("top1000DEGs_by_GeoMeanNest.direction",Con,Con_ind),match2.logFC, envir = parent.frame())
+  assign(paste0("DEGs.top2000.table_by_GeoMeanNest.",Con,Con_ind),match2.table, envir = parent.frame())
+  assign(paste0("DEGs.allGene.table_by_GeoMeanNest.",Con_ind),match2.table.all, envir = parent.frame())
+} # get DEGs (p < 0.05) and select top 1000 most differentiating genes using EdgeR against PCBs tissue concentrations
+
+assessmargin <- function(accuracy.Q.accum){
+  qt(0.975,df=length(accuracy.Q.accum)-1)*sd(accuracy.Q.accum)/sqrt(length(accuracy.Q.accum))
+} # determine margin
+
+lasso.by.nest.onesiteout.test <- function(Con,Con_ind,i) {
+  
+  nestid <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(MergeID)
+  match1 <- colnames(counts.tswallow.norm) %in% nestid
+  counts.con  <-  counts.tswallow.norm[,match1]
+  counts.con.batch <- as.factor(as.character(dds.bothSex.adjusted$batch2)[match1])
+  counts.con.sex <- as.factor(as.character(dds.bothSex.adjusted$sex)[match1])
+  contamin.raw <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(value.adjust) %>% log10()
+  contamin.matrix <- contaminants.coldata.subset2 %>% dplyr::slice(match(colnames(counts.con), contaminants.coldata.subset2$MergeID)) %>% filter(Key == Con_ind)
+  counts.con.contamin <- log10(contamin.matrix$value.adjust) ## get log10 value to suppress potential outlier
+  ## Building matrix 
+  if (length(levels(counts.con.batch)) > 1) {
+    counts.con.t <- as.data.frame(t(counts.con[get(paste0("top1000DEGs_by_GeoMeanNest.",Con,Con_ind)),]))
+    counts.con.t <- cbind(counts.con.t, batch = counts.con.batch, sex = counts.con.sex, contaminant = counts.con.contamin)
+    m <- model.matrix(contaminant ~ batch +., counts.con.t)
+    m <- m[,-1] } else {
+      counts.con.t <- as.data.frame(t(counts.con[get(paste0("top1000DEGs_by_GeoMeanNest.",Con,Con_ind)),]))
+      counts.con.t <- cbind(counts.con.t, sex = counts.con.sex, contaminant = counts.con.contamin)
+      m <- model.matrix(contaminant ~ ., counts.con.t)
+      m <- m[,-1] }  
+  ## make sure most of sites have testing samples, allsite: # of all genomic individuals, nestsite: # of genomic individuals with matching nest chemical info
+  counts.site  <-  dds.bothSex.adjusted$propersite2[match1]
+  matchsubset.train <- counts.site != unique(counts.site)[i] # train subset
+  print(c("training #", sum(matchsubset.train)))
+  matchsubset.test <- counts.site != unique(counts.site)[i]
+  l.lse <- {}
+  for (j in 1:20) {
+    cvfit <- cv.glmnet(x=m[matchsubset.train,], y=counts.con.t$contaminant[matchsubset.train], nfold = 10, alpha = 1, lambda = 10^seq(0,-2,length=200), relax =FALSE)
+    l.lse = c(l.lse, cvfit$lambda.1se)
+  }
+  l.lse = median(l.lse)
+  cvfit1 <- cv.glmnet(x=m[matchsubset.train,], y=counts.con.t$contaminant[matchsubset.train], nfold = 10, alpha = 1, lambda = 10^seq(0,-2,length=600), relax =FALSE)
+  ## only plot it 3 times in test runs
+  pdf(paste0("~/Documents/work/Tswallow_chem_GLRI_update/Temp_plots/ByNest_",Con_ind, "_distribution",".pdf"))
+  plot(sort(counts.con.contamin),main = paste0("ByNest.",Con_ind, ".distribution"), ylab = "log10(value)")
+  dev.off()
+  
+  pdf(paste0("~/Documents/work/Tswallow_chem_GLRI_update/Temp_plots/lamdaPlot_byNest_onesiteout",Con_ind, ".pdf"))
+  plot(cvfit1,main = paste0("R_lamdaPlot_leaveonesiteout.byNest.",Con_ind))
+  
+  dev.off()
+  } # test Run 
+
+## Run leave-one-out (by site) cross validation and train lasso regression against PCBs tissue concentrations 
+lasso.by.nest.onesiteout <- function(Con,Con_ind, s, lam.m,i) {
+  nestid <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(MergeID)
+  match1 <- colnames(counts.tswallow.norm) %in% nestid
+  counts.con  <-  counts.tswallow.norm[,match1]
+  counts.con.batch <- as.factor(as.character(dds.bothSex.adjusted$batch2)[match1])
+  counts.con.sex <- as.factor(as.character(dds.bothSex.adjusted$sex)[match1])
+  contamin.raw <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(value.adjust) %>% log10()
+  contamin.matrix <- contaminants.coldata.subset2 %>% dplyr::slice(match(colnames(counts.con), contaminants.coldata.subset2$MergeID)) %>% filter(Key == Con_ind)
+  counts.con.contamin <- log10(contamin.matrix$value.adjust) ## get log10 value to suppress potential outlier
+  ## Building matrix 
+  if (length(levels(counts.con.batch)) > 1) {
+    counts.con.t <- as.data.frame(t(counts.con[get(paste0("top1000DEGs_by_GeoMeanNest.",Con,Con_ind)),]))
+    counts.con.t <- cbind(counts.con.t, batch = counts.con.batch, sex = counts.con.sex, contaminant = counts.con.contamin)
+    m <- model.matrix(contaminant ~ batch +., counts.con.t)
+    m <- m[,-1] } else {
+      counts.con.t <- as.data.frame(t(counts.con[get(paste0("top1000DEGs_by_GeoMeanNest.",Con,Con_ind)),]))
+      counts.con.t <- cbind(counts.con.t, sex = counts.con.sex, contaminant = counts.con.contamin)
+      m <- model.matrix(contaminant ~ ., counts.con.t)
+      m <- m[,-1] }  
+  ## make sure most of sites have testing samples, allsite: # of all genomic individuals, nestsite: # of genomic individuals with matching nest chemical info
+  counts.site  <-  dds.bothSex.adjusted$propersite2[match1]
+  matchsubset.train <- counts.site != unique(counts.site)[i] # train subset
+  ## sample 90% 
+  matchsubset.train <- sample(which(matchsubset.train),(sum(matchsubset.train)*0.9))
+  print(c("training #", length(matchsubset.train)))
+  matchsubset.test <- counts.site == unique(counts.site)[i]
+  l.1se <- {}
+  l.min <- {}
+  for (j in 1:20) {
+    cvfit <- cv.glmnet(x=m[matchsubset.train,], y=counts.con.t$contaminant[matchsubset.train], nfold = 10, alpha = 1, lambda = 10^seq(0,-2,length=200), relax =FALSE)
+    l.1se <- c(l.1se, cvfit$lambda.1se)
+    l.min <- c(l.min, cvfit$lambda.min)
+  }
+  l.1se = median(l.1se)
+  l.min <- median(l.min)
+  l.median <- exp(mean(c(log(l.min),log(l.1se))))
+  lamda.sequence <- c(l.1se,l.min,l.median)
+  ByNestResult.withlamdaP <- {}
+  
+  fit <- glmnet(x=m[matchsubset.train,], y=counts.con.t$contaminant[matchsubset.train], alpha = 1, lambda = 10^seq(0,lam.m,length=600), relax = FALSE)
+  Result <- assess.glmnet(fit, newx = m[matchsubset.train,], newy = counts.con.t$contaminant[matchsubset.train], s = lamda.sequence[s])
+  
+  Result.lasso.assessment <- {}
+  Result.lasso.assessment$mse <- Result$mse[[1]]
+  Result.lasso.assessment$mae <- Result$mae[[1]]
+  
+  variables <- coef(fit, s = lamda.sequence[s])
+  Result.lasso.assessment$variables <- row.names(variables)[!(variables[,1] == 0)][-1] 
+  pseudo_R2 <- fit$dev.ratio[which(sort(c(lamda.sequence[s],10^seq(0,lam.m,length=600)),decreasing = TRUE) == lamda.sequence[s])[1] -1]
+  Result.lasso.assessment$pseudo_R2 <- pseudo_R2
+  
+  ## Building test matrix 
+  predict.site.test <- predict(fit, newx = m[matchsubset.test,], s = lamda.sequence[s]) 
+  result.list = list(lamda.sequence,Result.lasso.assessment,predict.site.test)
+  names(result.list) <- c("lamda.sequence","Result.relax.lasso.assessment","predictions")
+  return(result.list)
+} 
+Run_lasso.onesiteout <- function(n, Con, Con_ind, s, lam.m) {
+    lassoNestResult.run <- foreach(i = sample(rep(1:31,300),n), .packages = c("dplyr","glmnet"), .export = c("lasso.by.nest.onesiteout","contaminants.coldata.subset2","counts.tswallow.norm","dds.bothSex.adjusted", paste0("top1000DEGs_by_GeoMeanNest.",Con,Con_ind), "data.contaminants.majorSubset.geo.bysite")) %dopar% {
+    r_lasso_result <- Vectorize(lasso.by.nest.onesiteout)(Con,Con_ind, s, lam.m,i)
+    return(r_lasso_result)
+  }
+  assign(paste0("lassoResult.onesiteout",sub(" ","",Con_ind)), lassoNestResult.run, envir = parent.frame())
+  return(lassoNestResult.run)
+} # 31 sites, sample n out of  31*300 re-sampling 
+```
+
+#### Lasso regression analysis between global geene expression and PCB tissue concentrations
+Run lasso with leave one (site) cross validation and by selecting 1000 individuals from (31*300 resampling = 9300), using 1.1se   
+
+topgenelistPCBs.rds
+: selecting 91 genes which appeared more than 50 times (> 5%) in the cross-validation
+
+```{r Train PCB lasso model and cross-validaiton, eval = FALSE}
+## Total PCBs
+Con="PCBs_data";Con_ind="TOTAL PCBs"
+## refresh between chemicals 
+lamda.sequence <- {}
+Result.lasso.assessment <- {}
+variables <- {}
+predict.site.test <- {}
+rlassoResult <- list()
+## Set up PCBs chemistry data 
+contaminants.coldata.subset2 <-contaminants.coldata.subset
+## Individual chemicals 
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% filter(Key == Con_ind)
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% filter(!is.na(value.adjust)) ## remove those with value == "NR"
+## combine all duplicated items using mean value because they have the same nest id 
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% group_by(MergeID,Species,Matrix,AOC,Proper_Site,Key,type,class,MergeSite,proper_site2) %>% summarise(value.adjust2 = mean(value.adjust)) %>% ungroup()
+colnames(contaminants.coldata.subset2)[colnames(contaminants.coldata.subset2) == "value.adjust2"] <- "value.adjust" ## change the name back
+print(sum(duplicated(contaminants.coldata.subset2$MergeID))) ## check duplication again
+TotalPCBs.mergeIDlist = contaminants.coldata.subset2$MergeID  
+## Get top DEGs using DESeq2 against PCBs gradient  
+GetTopDEGs_byGeoMean.byNest(Con=Con,Con_ind=Con_ind) #103 DEGs (p < 0.05)
+# saveRDS(`DEGs.allGene.table_by_GeoMeanNest.TOTAL PCBs`, "~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS_figures/TOP.PCBs.allgene.table.bynest.rds")
+## Train lasso regression model using glmnet; relax lasso was not included because there was no significant improvement  
+
+## Register parallel 
+cl <- parallel::makeCluster(12)
+doParallel::registerDoParallel(cl)
+lassoResult.totalPCBs = Run_lasso.onesiteout(n= 1000, Con=Con,Con_ind=Con_ind, s= 1, lam.m=-2) # lamda.sequence <- c(l.1se,l.min,l.median); run lasso with leave one (site) cross validation and by selecting 1000 individuals from (31*300 resampling = 9300), using 1.1se 
+parallel::stopCluster(cl) # stop parallel
+## selecting those genes which were selected more than 50 times (> 5%)
+test.genelist.topPCB <- names(table(unlist(sapply(1:1000, function(x) lassoResult.totalPCBs[[x]][[2]]$variables))))[table(unlist(sapply(1:1000, function(x) lassoResult.totalPCBs[[x]][[2]]$variables))) > 50]
+## save top gene 
+saveRDS(test.genelist.topPCB, file ="topgenelistPCBs.rds") # 91 genes  
+
+```
+
+## 2. For selecting top predictor genes to predcit PAHs (by pooled stomach contents each site)  
+
+### Process coldata by site 
+```{r Process chemistry by site, eval = FALSE}
+data.contaminants.majorSubset.geo.bysite$MergeSite[data.contaminants.majorSubset.geo.bysite$MergeSite == "ref"] <- "SL" ## convert ref to SL 
+## combine all duplicated items by MergeSite
+data.contaminants.majorSubset.geo.bysite <- data.contaminants.majorSubset.geo.bysite %>% group_by(proper_site2,MergeSite,Key) %>% summarise(value.geoMean2 = mean(value.geoMean)) %>% ungroup()
+colnames(data.contaminants.majorSubset.geo.bysite)[colnames(data.contaminants.majorSubset.geo.bysite) == "value.geoMean2"] <- "value.geoMean" ## change the name back
+```
+
+### Load self-defined functions for lasso regression training
+GetTopDEGs_byGeoMean.bySiteGeoMean()
+: get top DEGs using edgeR linear regression against PAHs concentrations  
+
+lasso.by.site()
+: using top1000 DEGs for lasso regression analysis with 10-fold validation to determine lamda, leave one (site) out cross-validation, resample (sample 90%) of training data  
+
+Run_lasso_by_site
+: Run n runs of lasso.by.site()  
+
+
+```{r self-defined functions for PAHs lasso regression analysis, eval = FALSE}
+GetTopDEGs_byGeoMean.bySiteGeoMean <- function(Con,Con_ind) {
+  
+  match1 <- str_sub(colnames(counts.tswallow),3,4) %in% contaminants.coldata.subset2$MergeSite
+  counts.con  <-  counts.tswallow[,match1]
+  counts.con.batch <- as.factor(as.character(dds.bothSex.adjusted$batch2)[match1])
+  counts.con.sex <- as.factor(as.character(dds.bothSex.adjusted$sex)[match1])
+  counts.con.contamin <- log10(contaminants.coldata.subset2$value.geoMean[match(str_sub(colnames(counts.con),3,4), contaminants.coldata.subset2$MergeSite)])
+  
+  ## EdgeR needs non-normalized counts
+  y <- DGEList(counts=as.matrix(counts.con))
+  y <- calcNormFactors(y)
+  if (length(levels(counts.con.batch)) > 1) {
+    design <- model.matrix(~counts.con.batch+counts.con.sex+counts.con.contamin) ## add batch as cofactor
+    y <- estimateDisp(y,design)
+    fit <- glmQLFit(y,design)
+    qlf <- glmQLFTest(fit, coef=4)} else {
+      design <- model.matrix(~counts.con.sex+counts.con.contamin) ## add batch as cofactor
+      y <- estimateDisp(y,design)
+      fit <- glmQLFit(y,design) 
+      qlf <- glmQLFTest(fit, coef=3)
+    }
+  DEGs.Q <- sum(decideTests(qlf) != 0)
+  print(DEGs.Q)
+  match2 <- row.names(topTags(qlf, n=1000))
+  match2.logFC <- topTags(qlf, n=1000)[[1]][,"logFC"]
+  match2.table <- topTags(qlf, n=2000)
+  match2.table.all <- topTags(qlf, n=nrow(qlf))
+  match2.DEGs.table <- topTags(qlf, n=DEGs.Q)
+  assign(paste0("DEGs.table_by_GeoMeanSite.",Con,Con_ind),match2.DEGs.table, envir = parent.frame())
+  assign(paste0("top1000DEGs_by_GeoMeanSite.",Con,Con_ind),match2, envir = parent.frame())
+  assign(paste0("top1000DEGs_by_GeoMeanSite.direction",Con,Con_ind),match2.logFC, envir = parent.frame())
+  assign(paste0("DEGs.top2000.table_by_GeoMeanSite.",Con,Con_ind),match2.table, envir = parent.frame())
+  assign(paste0("DEGs.allGene.table_by_GeoMeanSite.",Con_ind),match2.table.all, envir = parent.frame())
+}
+
+# Min_L: for how low the lamda cv goes 10^(-2,-3,-4); s: lamda.sequence: 1) 1se 2) min 3) log median 
+lasso.by.site <- function(Con,Con_ind,i,Min_L,s) {
+  BySiteResult.withlamdaP <- {} ## refresh
+  variables.all <- list()
+  predict.site.test.all <- list()
+  match1 <- str_sub(colnames(counts.tswallow),3,4) %in% contaminants.coldata.subset2$MergeSite
+  counts.con  <-  counts.tswallow.norm[,match1]
+  counts.con.batch <- as.factor(as.character(dds.bothSex.adjusted$batch2)[match1])
+  counts.con.sex <- as.factor(as.character(dds.bothSex.adjusted$sex)[match1])
+  counts.con.contamin <- log10(contaminants.coldata.subset2$value.geoMean[match(str_sub(colnames(counts.con),3,4), contaminants.coldata.subset2$MergeSite)])
+  ## Building matrix 
+  if (length(levels(counts.con.batch)) > 1) {
+    counts.con.t <- as.data.frame(t(counts.con[get(paste0("top1000DEGs_by_GeoMeanSite.",Con,Con_ind)),]))
+    counts.con.t <- cbind(counts.con.t, batch = counts.con.batch, sex = counts.con.sex, contaminant = counts.con.contamin)
+    m <- model.matrix(contaminant ~ batch +., counts.con.t)
+    m <- m[,-1] } else {
+      counts.con.t <- as.data.frame(t(counts.con[get(paste0("top1000DEGs_by_GeoMeanSite.",Con,Con_ind)),]))
+      counts.con.t <- cbind(counts.con.t, sex = counts.con.sex, contaminant = counts.con.contamin)
+      m <- model.matrix(contaminant ~ ., counts.con.t)
+      m <- m[,-1] }  
+  
+  ## determinne training and testing set
+  counts.site  <-  dds.bothSex.adjusted$propersite2[match1]
+  match1.test <- counts.site == unique(counts.site)[i]
+  match1.test.sample <- sample(which(match1.test), size = median(table(counts.site)), replace = TRUE)
+  matchsubset.train <- counts.site != unique(counts.site)[i] # train subset
+  ## sample 90% of training set
+  matchsubset.train <- sample(which(matchsubset.train),(sum(matchsubset.train)*0.9))
+  
+  l.1se <- {} ## repeat 5 times to avoid outlier in cross validation 
+  l.min <- {}
+  # foldid<- as.numeric(as.factor(str_sub(colnames(counts.con[,matchsubset.train]),3,4))) # don't use foldid as batch effect for consistency
+
+  cvfit <- cv.glmnet(x=m[matchsubset.train,], y=counts.con.t$contaminant[matchsubset.train], nfolds = 10, alpha = 1, lambda = 10^seq(0,Min_L,length=600))
+  l.1se <- cvfit$lambda.1se
+  l.min <- cvfit$lambda.min
+  l.median <- exp(mean(c(log(l.1se),log(l.min))))
+  lamda.sequence <- c(l.1se,l.min,l.median)  
+  names(lamda.sequence) <- c("1se","min","median")
+    fit <- glmnet(x=m[matchsubset.train,], y=counts.con.t$contaminant[matchsubset.train], alpha = 1, lambda = 10^seq(0,Min_L,length=600))
+    Result1 <- assess.glmnet(fit, newx = m[match1.test.sample,], newy = counts.con.t$contaminant[match1.test.sample], s = lamda.sequence[s]) 
+    BySiteResult.withlamdaP$mse <- Result1$mse
+    BySiteResult.withlamdaP$mae <- Result1$mae
+    variables <- coef(fit, s = lamda.sequence[s])  
+    variables <- row.names(variables)[!(variables[,1] == 0)]
+    variables <- variables[-1]
+    
+    pseudo_R2 <- fit$dev.ratio[which(sort(c(lamda.sequence[s],10^seq(0,Min_L,length=600)),decreasing = TRUE) == lamda.sequence[s])[1] -1]
+    predict.site.test1 <- predict(fit, newx = m[match1.test.sample,], s = lamda.sequence[s]) 
+    predict.site.test.all <- predict.site.test1
+    
+    result = list(lamda.sequence,BySiteResult.withlamdaP,variables,pseudo_R2,predict.site.test.all)
+    names(result) <- c("lamda.sequence","mse_mae","variables","pseudo_R2","predict.site")
+    return(result)
+}
+Run_lasso_by_site <- function(n,Con,Con_ind,Min_L,s) {
+TIME1 <- Sys.time()
+lassositeResult.run <- foreach(i = rep(1:28,n), .packages = c("dplyr","glmnet"), .export = c("lasso.by.site","contaminants.coldata.subset2","counts.tswallow.norm","dds.bothSex.adjusted", paste0("top1000DEGs_by_GeoMeanSite.",Con,Con_ind), "data.contaminants.majorSubset.geo.bysite")) %dopar% {
+  cat(paste("Starting iteration",i,Sys.time(),"\n"), file = paste0("~/Documents/work/Tswallow_chem_GLRI_update/relax_lasso_result/",Con_ind,"lassoBySiteRun.log2.txt"), append = TRUE)
+  lasso_result <- Vectorize(lasso.by.site)(Con,Con_ind,i,Min_L,s)
+  return(lasso_result)
+}
+return(lassositeResult.run)
+TIME2 <- Sys.time()
+print(TIME2 - TIME1)
+} 
+```
+
+### Lasso regression analysis between global geene expression and PAH concentrations
+Run lasso with leave one (site) cross validation, lamda chose l.1se for selecting top predictor genes from top 1000 genes (EdgeR, linear regression against PAHs concentrations)
+lasso_topgene_bySite_PAHs.rds
+: selecting top 110 genes in the cross-validation (> 10% of cross-validation)  
+```{r Train PAH lasso model and cross-validaiton, eval = FALSE}
+
+Con="PAHs_data";Con_ind="Total PAHs"
+## edit subset for overlapping genomic samples with contaminant data 
+contaminants.coldata.subset2 <-data.contaminants.majorSubset.geo.bysite
+## Individual chemicals 
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% filter(Key == Con_ind)
+## combine all duplicated items using mean value because they have the same MergeSite ## only River Raisin will be affected 
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% group_by(MergeSite, Key) %>% summarise(value.geoMean2 = mean(value.geoMean)) %>% ungroup()
+colnames(contaminants.coldata.subset2)[colnames(contaminants.coldata.subset2) == "value.geoMean2"] <- "value.geoMean" ## change the name back to value.geoMean
+print(sum(duplicated(contaminants.coldata.subset2$MergeSite))) ## check duplication again
+GetTopDEGs_byGeoMean.bySiteGeoMean(Con = Con, Con_ind = Con_ind) ## 570 DEGs (p < 0..05) against PAHs tissue concentrations
+# saveRDS(`DEGs.allGene.table_by_GeoMeanSite.Total PAHs`,"~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS_figures/TOP.PAHs.allgene.table.bysite.rds")
+
+## Run lasso regression by site to predict PAHs tissue concentrations
+registerDoParallel(cores = 12)
+## Becasue the purpose 
+lassoResult.bySite.TotalPAHs = Run_lasso_by_site(n=200,Con=Con,Con_ind = Con_ind, Min_L = -2, s = 1) # lamda.sequence <- c(l.1se,l.min,l.median)
+parallel::stopCluster(cl) # stop parallel
+lassoResult.bySite = lassoResult.bySite.TotalPAHs
+# saveRDS(lassoResult.bySite.TotalPAHs,"~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/lasso_topgene_bySite_PAHs.rds")
+
+## 100% trials have less than 95 genes, go ahead and pick genes appears at 10% of trials 
+lasso_selected_topgene <- names(sort(table(unlist(sapply(1:(28*200),function(x) lassoResult.bySite[[x]][[3]]))),decreasing = TRUE)[1:110])
+# saveRDS(lasso_selected_topgene, "~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/lasso_topgene_bySite_PAHs.rds")
+```
+

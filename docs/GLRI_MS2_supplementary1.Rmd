@@ -1,0 +1,114 @@
+---
+title: 'GLRI_MS2_supplementary 1'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setwd, include=FALSE}
+setwd("/home/chiyen/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all")
+```
+### 1. Reads were trimmed (`Trimmomatic-0.36`) using customized `TruSeqPE_cy.fa` and evaluated with `FastQC`
+*Remove (TruSeqPE_cy.fa:2:15:8:2) Remove leading low quality or N bases:5 Remove trailing low quality or N bases:5 Scan the read with a 4-base wide sliding window, cutting when the average quality per base drops below 15 (SLIDINGWINDOW:4:15); Drop reads below the 36 bases long*
+```
+Customized TruSeqPE_cy.fa
+>Illumina
+AGATCGGAAGAGC
+>Illumina_RNA_RT_Primer
+CCTTGGCACCCGAGAATTCCA
+>RNA_PCR_Primer_Index
+CAAGCAGAAGACGGCATACGAGAT
+>Illumina_RNA_PCR_Primer
+AATGATACGGCGACCACCGAGA
+>Illumina_PCR_Primer_Index
+CAAGCAGAAGACGGCATACG
+>TruSeq_LT_Read1
+AGATCGGAAGAGCACACGTCTGAACTCCAGTCA
+>TruSeq_LT_Read2
+AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT
+```
+
+```{bash, Trimmomaticscript, eval= FALSE}
+
+cd $PBS_O_WORKDIR
+module load trimmomatic
+module load gnu-parallel/20170622
+
+
+parallel --link -j1 'java -jar /N/soft/rhel7/trimmomatic/0.36/trimmomatic-0.36.jar PE -phred33 {}_R1_001.fastq.gz {}_R2_001.fastq.gz {}_R1_qc.fq.gz {}_S1_fq.gz {}_R2_qc.fq.gz {}_S2_fq.gz ILLUMINACLIP:/N/project/Tswallow_GLRP/Tswallow_processed/Trimmed_files/Adapters/TruSeqPE_cy.fa:2:15:8:2 LEADING:5 TRAILING:5 SLIDINGWINDOW:4:15 MINLEN:36' ::: $(ls *_R1_001.fastq.gz | sed 's/_R1_001.fastq.gz//g')
+
+
+cd $PBS_O_WORKDIR
+module load fastqc/0.11.5 
+parallel -j8 'fastqc {}' ::: $(ls *_qc.fq.gz)
+
+
+```
+
+### 2. Then aligned (`STAR/2.6.1`) against tree swallow genome (*BioProject PRJNA835816*)
+
+```{Star script}
+
+
+cd /N/project/Tswallow_GLRP/Tswallow_processed/alignment
+module load star/2.6.1a
+module load gnu-parallel/20170622
+
+## ln -s /N/project/Tswallow_GLRP/Tswallow_processed/Trimmed_files/2019_trimmed/*_qc.fq.gz .
+
+parallel -j2 \
+'STAR --genomeDir Renamed_tswallow_contig_index \
+--runThreadN 8 \
+--readFilesCommand zcat \
+--readFilesIn {}_R1_qc.fq.gz {}_R2_qc.fq.gz \
+--outFileNamePrefix {}_ \
+--outTmpDir {}_temp \
+--alignIntronMin 10 \
+--alignIntronMax 250000 \
+--alignMatesGapMax 250000 \
+--outSAMtype BAM SortedByCoordinate \
+--outSAMunmapped Within \
+--outSAMattributes Standard' ::: $(ls *_qc.fq.gz | awk -F_ '{print $1}')
+```
+
+### 3. Finally estimate abundance using `featureCounts`; for year 2015 to 2017, there were paired-end, stranded reads and for 2018 to 2019, there were paired-end, non-stranded reads
+
+```{bash, feature counts script, eval=FALSE}
+#PBS -k oe
+#PBS -m abe
+#PBS -M chi-yen_tseng@baylor.edu
+#PBS -N featurecounts_run
+#PBS -l nodes=1:ppn=8,vmem=16gb,walltime=24:00:00
+
+#!/bin/bash
+
+cd $PBS_O_WORKDIR
+
+## load featurecounts
+export PATH=/N/dc2/projects/Tswallow_GLRP/CT/program/subread-1.6.5-source/bin:$PATH
+
+## use feature counts to do abundance estimation result 50~ 70 % -p pair-ended, -s reversely stranded (for ts_18 non-stranded), -t gene, -a using blastp results in annotation files, -o output all results
+featureCounts -T 8 -p -s 2 -t gene -a Tbic_Run3_2.renamed.putative_function.gff -o ts_15.featureCounts -g ID ts_15/*.bam
+featureCounts -T 8 -p -s 2 -t gene -a Tbic_Run3_2.renamed.putative_function.gff -o ts_16.featureCounts -g ID ts_16/*.bam
+featureCounts -T 8 -p -s 2 -t gene -a Tbic_Run3_2.renamed.putative_function.gff -o ts_17.featureCounts -g ID ts_17/*.bam
+featureCounts -T 8 -p -s 0 -t gene -a Tbic_Run3_2.renamed.putative_function.gff -o ts_18.featureCounts -g ID ts_18/*.bam
+
+## for 2019 batch
+/home/chiyen/subread-1.6.5-source/bin/featureCounts -T 8 -p -s 0 -t gene -a  Tbic_Run3_2.all.gff -o ts_19.featureCounts -g ID *.bam
+```
+
+### 4. Adjust sequencing batch effects between sequencing-year using `ComBat_seq` (sva v3.36.0)
+
+
+```{R, CombatSeq adjust batch effects, eval=FALSE}
+BiocManager::install("sva")
+library(sva)
+## load counts matrix
+counts_bothsex <- read.csv("Tswallow_counts_bothsex.csv", row.names = 1)
+## load coldata batch sex info
+coldata <- read.csv("Tswallow_coldata_bothsex.csv", row.names = 1)
+count_matrix <- as.matrix(counts_bothsex)
+batch <- coldata$batch
+## using combat_seq to do batch adjust 15 16 17 18 19 
+adjusted.withSex <- ComBat_seq(count_matrix, batch=batch, group=NULL,full_mod=FALSE)
+```
