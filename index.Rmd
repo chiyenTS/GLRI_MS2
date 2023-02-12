@@ -1,0 +1,59 @@
+---
+title: 'Integrated analysis and modelling of contaminant mixtures and transcriptomic responses in Tree Swallow (Tachycineta bicolor) nestlings in the Great Lakes'
+output:
+  html_document:
+    df_print: paged
+    theme: cerulean
+---
+
+**Chi Yen Tseng^1^**, Christine M. Custer^2^, Thomas W. Custer^2^, Paul M. Dummer^2^, Natalie Karouna‐Renier^3^ and Cole W. Matson^1^
+
+1. Department of Environmental Science, The Institute of Ecological, Earth, and Environmental Sciences (TIE3S), and the Center for Reservoir and Aquatic Systems Research (CRASR), Baylor University, Waco, Texas 76798, United States 
+2. Upper Midwest Environmental Sciences Center, U.S. Geological Survey, La Crosse, Wisconsin 54603, United States 
+3. U.S. Geological Survey, Eastern Ecological Science Center (EESC) at Patuxent, Beltsville, Maryland 20705, United States
+
+Any use of trade, product, or firm names is for descriptive purposes only and does not imply endorsement by the U.S. Government.
+</br>
+
+## Documents included
+
+1. [Supplementary document 1](GLRI_MS2_supplementary1.html) describes RNA-Seq processing procedures, parameter, and scripts.  
+2. [Supplementary document 2](GLRI_MS2_compile.html) includes all the R scripts to ensure the reproducible results of regression, lasso models, and data visualization.  
+3. [Supplementary document 2.2](GLRI_MS2_FirstRound_lasso.html) includes R scripts for first round of lasso regression analysis   
+
+
+![All the GLRI sampling sites](GLRI_site_map.png)  
+</br>
+
+![](https://d9-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/s3fs-public/styles/medium/public/springsummer2011_003.jpg?itok=s5voM6CA) ![](https://d9-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/s3fs-public/styles/medium/public/thumbnails/image/DSC01717.JPG?itok=g6WbCIFP)
+</br>
+*Transcriptome was measured in the nestling livers and contaminant concentrations were measured in their carcasses.* 
+
+</br>
+
+```{r contaminants_pheatmap, fig.show="hold", out.width="50%", fig.height=11, echo=FALSE}
+library(pheatmap)
+contaminants_pheatmap <- readRDS("/home/chiyen/Documents/work/Tswallow_chem_GLRI_update/Update_chem_bioindicator_GLRI/contaminants_pheatmap.rds")
+contaminants_pheatmap
+altered_funcions_DEG_heatmap <- readRDS("Figure3aaltered_funcions_DEG_heatmap.rds")
+altered_funcions_DEG_heatmap
+```
+We developed a system to integrate transcriptomic responses with contaminant concentrations to determine and model the effects of PCBs, PAHs, PBDEs, or PFOS on Tree Swallow nestlings, amid a complex mixture of environmental contaminants. Exposures to PCBs or PFOS were associated with an upregulation of genes involving lipid metabolic processes, especially cholesterol biosynthesis. Exposures to PAHs or PBDEs were associated with a downregulation in genes involving in cell cycle regulation. An upregulation in immune response genes was also found in nestlings exposed to PBDEs.  
+
+</br>
+
+
+#### These models can be used to determine    
+* If either PCB or PAH exposure can explain biological effects.      
+* If the remediation decreased both measured PCB concentrations and predicted PCB effective concentrations, i.e., biological effects.     
+
+```{r remediation and site mixture prediction, fig.show="hold", out.width="50%", fig.height=8, echo=FALSE}
+model_site_regression_all <- readRDS("Fig_model_site_regression_all.rds")
+model_site_regression_all
+yyplot.bysite.remediation <- readRDS("Fig_yyplot.bysite.remediation.rds")
+yyplot.bysite.remediation
+```
+I used Lasso linear regression models to predict PCB or PAH concentrations. And the predicted and measured PCB concentration at Waukegan harbor were plotted by year, before and after remediation.
+
+</br>
+
