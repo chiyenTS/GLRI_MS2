@@ -1,0 +1,1611 @@
+---
+title: 'Integrated analysis and modelling of contaminant mixtures and transcriptomic responses in Tree Swallow (Tachycineta bicolor) nestlings in the Great Lakes'
+output:
+  html_document:
+    df_print: paged
+    theme: cerulean
+    code_download: true
+---
+
+Chi Yen Tseng^1^, Christine M. Custer^2^, Thomas W. Custer^2^, Paul M. Dummer^2^, Natalie Karouna‐Renier^3^ and Cole W. Matson^1^
+
+1. Department of Environmental Science, The Institute of Ecological, Earth, and Environmental Sciences (TIE3S), and the Center for Reservoir and Aquatic Systems Research (CRASR), Baylor University, Waco, Texas 76798, United States 
+2. Upper Midwest Environmental Sciences Center, U.S. Geological Survey, La Crosse, Wisconsin 54603, United States 
+3. U.S. Geological Survey, Eastern Ecological Science Center (EESC) at Patuxent, Beltsville, Maryland 20705, United States
+
+</br>
+
+![Image of GLRI_site](GLRI_site_map.png)
+**All the sites included in this study**  
+
+Detail location can be downloaded here at [GLRI_site_details](Table1_siteName_locations.csv)
+
+```{css, echo=FALSE}
+pre {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+pre[class] {
+  max-height: 100px;
+}
+```
+</br>
+
+## Load all packages
+```{r Load packages, message=FALSE}
+library(glmnet)
+library(edgeR)
+library(readr)
+library(tidyverse)
+library(foreach)
+library(doParallel)
+library(reshape2)
+library(stringr)
+library(ggpubr)
+library(ggrepel)
+library(ComplexHeatmap)
+library(ggplot2)
+library(GGally)
+
+```
+</br>
+
+## Prepare global gene expression data and contaminant data  
+</br>
+
+ `GLRI_coldata`  
+: chemistry data ("Dioxin" "MultiRedsiduePest" "PAHs" "PBDEs" "LRPCBs" "HRPCBs" "Pesticides" "PFCs" "PPCPs")  &nbsp;  
+- `data.contaminants.majorSubset.geo.bysite`
+: geometric mean of each contaminant key by site  
+
+ `contaminants.coldata.subset`
+: only includes the nestlings with genomic information and removes PAHs data  
+
+ `ID.convert`
+: gene ID convertion table between tree swallow gene pseudo name and chicken gene name  
+
+ `siteMAP.all`
+: site ID and propersite name convertion Table  
+
+ `dds.bothSex.adjusted or counts.tswallow`
+: normalized count matrix for all nestlings, adjusted for batch difference  
+
+ `Cont.major.list`
+: major contaminants ("Nonachlor, cis-_C", "Heptachlor Epoxide_C",   "Nonachlor, trans-_C",  "PFDA_C", "Chlordane, oxy-_C", "Total Parent PAHs", "Total PBDE", "Total PAHs","Total PCBs","Total_PFCs")
+
+ `counts.tswallow.norm`
+: vst transformed normalized counts   
+```{r Load data, include=FALSE}
+setwd("/home/chiyen/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all")
+# load data 
+GLRI_coldata <- readRDS("GLRI_coldata_to2020.rds")
+# Determine min contamin value for each Key
+GLRI_coldata <- GLRI_coldata$contaminants %>% filter(!is.na(Value))
+# Load GeoMean
+data.contaminants.majorSubset.geo.bysite <- readRDS("data_contaminants_majorSubset_geo_bysite.rds")
+contaminants.min.adjusted <- GLRI_coldata %>% group_by(Key,class) %>% summarise(minValue = min(as.numeric(value.adjust),na.rm = TRUE)) %>% ungroup()
+contaminants.coldata.subset <- read_csv("GLRI_TRES_contaminantsto2020_Transcriptome_subset_CT.csv")
+contaminants.coldata.subset <- contaminants.coldata.subset %>% filter(!is.na(Value)) ## remove those with only NA
+contaminants.coldata.subset <- contaminants.coldata.subset %>% left_join(contaminants.min.adjusted, by = c("Key","class"))
+contaminants.coldata.subset <- contaminants.coldata.subset %>% filter(!minValue == "Inf") ## remove those with only "."
+contaminants.coldata.subset$value.adjust[contaminants.coldata.subset$Value == "."] <- contaminants.coldata.subset$minValue[contaminants.coldata.subset$Value == "."]/3 # "." converts to 1/3 of loweast detetable value
+is.AOC.table <- contaminants.coldata.subset %>% dplyr::select(AOC, proper_site2) %>% distinct()
+
+ID.convert <- readRDS("IDmap_final.rds") ## gene ID Convert table
+siteMAP.all <- as_tibble(readRDS("siteMAP_all.rds")) ## site ID convert Table
+siteMAP.all$SiteID[siteMAP.all$propersite == "StarLake"] <- "SL"
+dds.bothSex.adjusted <- readRDS("dds.bothSex.adjusted.outlierRM.rds") ## normalized count matrix
+dds.bothSex.adjusted <- dds.bothSex.adjusted[,colnames(dds.bothSex.adjusted) != "19HW576B"] ## remove "19HW576B" only use A chick for the analysis for regression analysis
+colnames(dds.bothSex.adjusted) <- gsub("A$|B$", "", colnames(dds.bothSex.adjusted)) ## remove all the A or B tail 
+dds.bothSex.adjusted$propersite2 <- as.character(siteMAP.all$propersite[match(dds.bothSex.adjusted$site, siteMAP.all$SiteID)]) 
+counts.tswallow <- assay(dds.bothSex.adjusted)
+Cont.major.list <- c("Nonachlor, cis-_C", "Heptachlor Epoxide_C",   "Nonachlor, trans-_C",  "PFDA_C", "Chlordane, oxy-_C", "Total Parent PAHs", "Total PBDE", "Total PAHs","Total PCBs","Total_PFCs")
+## contaminants.coldata.subset2: There are some PCBs are LRPCBs, some are HRPCBs. Combining all of  "TOTAL PCBs_C", and "TOTAL PCBs" into "TOTAL PCBs" and if there are overlapping, pick LRPCBs first 
+contaminants.coldata.subset <- contaminants.coldata.subset %>% filter(class != "PAHs")
+contaminants.coldata.subset <- contaminants.coldata.subset %>% mutate(MergeSite=replace(MergeSite, MergeSite == "ref", "SL")) ## replace ref to SL 
+contaminants.coldata.subset$MergeID <- gsub("-","", contaminants.coldata.subset$MergeID) ## remove all dash
+contaminants.coldata.subset$MergeID <- gsub("A$","", contaminants.coldata.subset$MergeID) ## remove A tail
+contaminants.coldata.subset <- contaminants.coldata.subset %>% mutate(Key=replace(Key, Key == "TOTAL PCBs_C" | Key == "TOTAL PCBs", "TOTAL PCBs"))
+counts.tswallow.norm <- vst(dds.bothSex.adjusted)
+counts.tswallow.norm <- assay(counts.tswallow.norm)
+```
+</br>
+
+## 1. Determine lasso regression models to predict PCB concentrations 
+</br>
+
+### Load top genes list  
+</br>
+
+`topgenelistPCBs.rds`, including 91 genes which were appeared more than 5% in the first round of lasso regression analysis in the cross-validation. Detail script of first round lasso models were provided [here](GLRI_MS2_FirstRound_lasso.nb.html)  
+</br>
+
+### Load self-determined lasso training and permorance evaluation models
+</br>
+
+-  `lasso.by.site.PCBs.top100.lasso(i,Con,Con_ind, test.genelist, s, lam.m)`
+  : leave one ( `i` site) out to build lasso regression models to predict concentrations of contaminant (`Con` and `Con_ind`) using top predictor genes (`genelist`), model parameter lamda (`s`: 1se and `lam.m`: minimum log10 lamda value to test model fit)  
+  
+-  `Run_lasso.by.site.PCBs.top100.lasso(re, Con, Con_ind, s, lam.m)`
+  : Run `lasso.by.site.PCBs.top100.lasso` function `re` times  
+  
+-  `evaluation_funciton.bysite`
+  : calculate site performance by site, mean square error (MSE), accuracy, and error rate are calculated based on predicted site geometric mean versus actual geometric mean  
+  
+-  `evaluation_funciton.byindividual`
+  : calculate site performance by individual nest, ignoring site factor, mean square error (MSE), accuracy, and error rate are calculated based on predicted vs actual value
+  
+```{r Load PCBs lasso training functions, message=FALSE, warning=FALSE}
+## Con, Con_ind: contaminant type; test.genelist: top genes selected from the first run; s: lamda.sequence (l.1se,l.min,l.median); lam.m: lambda = 10^seq(0,lam.m,length=600)
+lasso.by.site.PCBs.top100.lasso <- function(i,Con,Con_ind, test.genelist, s, lam.m) {
+  ## genomic samples with the same nest id
+  nestid <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(MergeID)
+  match1 <- colnames(counts.tswallow.norm) %in% nestid
+  counts.con  <-  counts.tswallow.norm[,match1]
+  counts.con.batch <- as.factor(as.character(dds.bothSex.adjusted$batch2)[match1])
+  counts.con.sex <- as.factor(as.character(dds.bothSex.adjusted$sex)[match1])
+  contamin.raw <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(value.adjust) %>% log10()
+  contamin.matrix <- contaminants.coldata.subset2 %>% dplyr::slice(match(colnames(counts.con), contaminants.coldata.subset2$MergeID)) %>% filter(Key == Con_ind)
+  counts.con.contamin <- log10(contamin.matrix$value.adjust) ## get log10 value to suppress potential outlier
+  site.list = unique(as.character(dds.bothSex.adjusted$site[match1]))
+  ## Building matrix
+  if (length(levels(counts.con.batch)) > 1) {
+    counts.con.t <- as.data.frame(t(counts.con[test.genelist,]))
+    counts.con.t <- cbind(counts.con.t, batch = counts.con.batch, sex = counts.con.sex, contaminant = counts.con.contamin)
+    m <- model.matrix(contaminant ~ batch +., counts.con.t) # m for training
+    m <- m[,-1] } else {
+      counts.con.t <- as.data.frame(t(counts.con[test.genelist,]))
+      counts.con.t <- cbind(counts.con.t, sex = counts.con.sex, contaminant = counts.con.contamin)
+      m <- model.matrix(contaminant ~ ., counts.con.t)
+      m <- m[,-1] }
+  ## to include all genomic samples as m2
+  nestid <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(MergeID)
+  counts.con2  <-  counts.tswallow.norm
+  counts.con.batch2 <- as.factor(as.character(dds.bothSex.adjusted$batch2))
+  counts.con.sex2 <- as.factor(as.character(dds.bothSex.adjusted$sex))
+
+  ## Building matrix
+  if (length(levels(counts.con.batch2)) > 1) {
+    counts.con.t2 <- as.data.frame(t(counts.con2[test.genelist,]))
+    counts.con.t2 <- cbind(counts.con.t2, batch = counts.con.batch2, sex = counts.con.sex2)
+    m2 <- model.matrix(~ batch +., counts.con.t2) # m2 for validation in leave one site out
+    m2 <- m2[,-1] } else {
+      counts.con.t2 <- as.data.frame(t(counts.con2[test.genelist,]))
+      counts.con.t2 <- cbind(counts.con.t2, sex = counts.con.sex2)
+      m2 <- model.matrix( ~ ., counts.con.t2)
+      m2 <- m2[,-1] }
+
+  site.count.nest.subset = table(str_sub(colnames(counts.con),3,4))
+  site.count.genomic.subset = table(str_sub(colnames(counts.con2),3,4))
+  # sites_verifications = c("ER", "HW", "LS", "PB", "SC", "SP", "ST", "TH", "WK")
+
+  ## CV leave one out by site
+    test.site = str_sub(row.names(m),3,4) %in% site.list[i]
+    l.1se <- {} ; l.min <- {}
+
+    for (j in 1:20) {
+      cvfit <- cv.glmnet(x=m[!test.site,], y=counts.con.t$contaminant[!test.site], nfold = 10, alpha = 1, lambda = 10^seq(0,lam.m,length=600), relax =FALSE)
+      
+      l.1se <- c(l.1se, cvfit$lambda.1se)
+      l.min <- c(l.min, cvfit$lambda.min)
+      
+    } # repeat 20 times and pick median lamda to avoid picking extreme in 10 folds cross validation
+    l.1se <- median(l.1se)
+    l.min <- median(l.min)
+    l.median <- exp(mean(c(log(l.min),log(l.1se))))
+    lamda.sequence <- c(l.1se,l.min,l.median)
+
+    ByNestResult.withlamdaP <- {}
+    training.site = sample(which(!test.site), round(sum(!test.site)*0.9))
+    fit.lasso <- glmnet(x=m[training.site,], y=counts.con.t$contaminant[training.site], alpha = 1, lambda = 10^seq(0,lam.m,length=600)) # lasso model using training set
+    
+    ## get all the metrics c(features, dev.ratio, lamda)
+    variables = coef(fit.lasso, s = lamda.sequence[s])[,1]
+    variables = variables[variables != 0][-1]
+    dev.ratio = fit.lasso$dev.ratio[which(sort(c(lamda.sequence[s],10^seq(0,lam.m,length=600)),decreasing = TRUE) == lamda.sequence[s])[1] -1]
+    
+    ## get all predictions using all avaialble genomic samples
+    test.site2 = str_sub(row.names(m2),3,4) == site.list[i]
+    
+    ## lasso
+    predict.all.genomic.samples.subset <- predict(fit.lasso, newx = m[test.site,], s = lamda.sequence[s]) ## only use overlapped portion
+    predict.all.genomic.samples <- predict(fit.lasso, newx = m2[test.site2,], s = lamda.sequence[s]) ## only use overlapped portion
+
+    predict.all.genomic.samples.subset.lasso = predict.all.genomic.samples.subset[,1]
+    predict.all.genomic.samples.lasso = predict.all.genomic.samples[,1]
+
+    predict.all.genomic.samples.subset.lasso.mean = mean(predict.all.genomic.samples.subset.lasso)
+    names(predict.all.genomic.samples.subset.lasso.mean) = site.list[i]
+    predict.all.genomic.samples.lasso.mean = mean(predict.all.genomic.samples.lasso)
+    names(predict.all.genomic.samples.lasso.mean) = site.list[i]
+
+    ## combine
+    result = list(variables =variables, dev.ratio = dev.ratio ,lamda.sequence = lamda.sequence, predict.all.genomic.samples.subset.lasso = predict.all.genomic.samples.subset.lasso, predict.all.genomic.samples.subset.lasso.mean = predict.all.genomic.samples.subset.lasso.mean, predict.all.genomic.samples.lasso = predict.all.genomic.samples.lasso, predict.all.genomic.samples.lasso.mean = predict.all.genomic.samples.lasso.mean)
+  return(result)
+}
+Run_lasso.by.site.PCBs.top100.lasso <- function(re, Con, Con_ind, s, lam.m) {
+  lassoCVbysite <- foreach(i = rep(1:31, each = re), .packages = c("dplyr","glmnet","stringr"), .combine = 'cbind', .export = c("lasso.by.site.PCBs.top100.lasso", "contaminants.coldata.subset2","counts.tswallow.norm","dds.bothSex.adjusted", "test.genelist", "data.contaminants.majorSubset.geo.bysite")) %dopar% {
+    LassoCVbysite_result <- Vectorize(lasso.by.site.PCBs.top100.lasso(i,Con,Con_ind, test.genelist, s, lam.m))
+    return(LassoCVbysite_result)
+  }
+
+  return(lassoCVbysite)
+}
+evaluation_funciton.bysite <- function(Result) {
+  result.all <- {}
+  evaluation.result <- {}
+  predictions = Result
+  ## geoMean: only use overlapped genomic site individulas training samples to calculate geoMean
+  predictions2 = data.frame(site = names(Result), predictions, geoMean = contaminant.geoMean.bysite.genomic[names(Result)], b33 =  quantile(contaminant.geoMean.bysite, probs = 0.33, na.rm = FALSE, names = FALSE), t33 = quantile(contaminant.geoMean.bysite, probs = 0.67, na.rm = FALSE, names = FALSE))
+  predictions3 = cbind(predictions2, is.top33 = predictions2$geoMean >= predictions2$t33, is.bottom33 = predictions2$geoMean <= predictions2$b33, is.top.predict = predictions2$predictions >= predictions2$t33, is.bottom.predict = predictions2$predictions <= predictions2$b33)
+  predictions.all = predictions3
+  predictions.all$delta = (predictions.all$predictions - predictions.all$geoMean)^2
+  MSE = sum(predictions.all$delta)/nrow(predictions.all)
+  
+  error.top =  sum(predictions.all$is.top.predict & predictions.all$is.bottom33)/ sum(predictions.all$is.top.predict)
+  
+  error.bottom = sum(predictions.all$is.bottom.predict & predictions.all$is.top33)/ sum(predictions.all$is.bottom.predict) 
+  
+  error.both = sum((predictions.all$is.top.predict & predictions.all$is.bottom33)  | (predictions.all$is.bottom.predict & predictions.all$is.top33))/ sum(predictions.all$is.bottom.predict | predictions.all$is.top.predict) 
+  
+  accuracy.top =  sum(predictions.all$is.top.predict & predictions.all$is.top33)/ sum(predictions.all$is.top.predict) 
+  
+  accuracy.bottom = sum(predictions.all$is.bottom.predict & predictions.all$is.bottom33)/ sum(predictions.all$is.bottom.predict) 
+  
+  accuracy.both = sum((predictions.all$is.top.predict & predictions.all$is.top33)  | (predictions.all$is.bottom.predict & predictions.all$is.bottom33))/ sum(predictions.all$is.bottom.predict | predictions.all$is.top.predict) 
+  
+  testing_ratio = c(top_ratio = sum(predictions.all$is.top33)/nrow(predictions.all), bottom_ratio = sum(predictions.all$is.bottom33)/nrow(predictions.all))
+  
+  performance.result = c(error.top = error.top,error.bottom = error.bottom, error.both = error.both, accuracy.top = accuracy.top ,accuracy.bottom = accuracy.bottom,accuracy.both = accuracy.both, testing_ratio, MSE = MSE)
+  evaluation.result = list(predictions.by.site=predictions.all, performance.result = performance.result)
+  return(evaluation.result)
+}
+evaluation_funciton.byindividual <- function(Result) {
+  result.all <- {}
+  evaluation.result <- {}
+  predictions = Result
+  ## geoMean: only use overlapped genomic site individulas training samples to calculate geoMean
+  predictions2 = data.frame(mergeID = names(Result), predictions, actural = contamin.array[names(predictions)] , b33 =  quantile(contaminant.geoMean.bysite, probs = 0.33, na.rm = FALSE, names = FALSE), t33 = quantile(contaminant.geoMean.bysite, probs = 0.67, na.rm = FALSE, names = FALSE))
+  predictions3 = cbind(predictions2, is.top33 = predictions2$actural >= predictions2$t33, is.bottom33 = predictions2$actural <= predictions2$b33, is.top.predict = predictions2$predictions >= predictions2$t33, is.bottom.predict = predictions2$predictions <= predictions2$b33)
+  predictions3 = predictions3[!is.na(predictions3$is.bottom33),]
+  predictions.all = predictions3
+  predictions.all$delta = (predictions.all$predictions - predictions.all$actural)^2
+  MSE = sum(predictions.all$delta)/nrow(predictions.all)
+  
+  
+  error.top =  sum(predictions.all$is.top.predict & predictions.all$is.bottom33)/ sum(predictions.all$is.top.predict)
+  
+  error.bottom = sum(predictions.all$is.bottom.predict & predictions.all$is.top33)/ sum(predictions.all$is.bottom.predict) 
+  
+  error.both = sum(predictions.all$is.top.predict & predictions.all$is.bottom33 | predictions.all$is.bottom.predict & predictions.all$is.top33)/ sum(predictions.all$is.top.predict | predictions.all$is.bottom.predict) 
+  
+  accuracy.top =  sum(predictions.all$is.top.predict & predictions.all$is.top33)/ sum(predictions.all$is.top.predict) 
+  
+  accuracy.bottom = sum(predictions.all$is.bottom.predict & predictions.all$is.bottom33)/ sum(predictions.all$is.bottom.predict) 
+  
+  accuracy.both = sum((predictions.all$is.top.predict & predictions.all$is.top33)  | (predictions.all$is.bottom.predict & predictions.all$is.bottom33))/ sum(predictions.all$is.bottom.predict | predictions.all$is.top.predict) 
+  
+  testing_ratio = c(top_ratio = sum(predictions.all$is.top33)/nrow(predictions.all), bottom_ratio = sum(predictions.all$is.bottom33)/nrow(predictions.all))
+  
+  performance.result = c(error.top = error.top,error.bottom = error.bottom, error.both = error.both, accuracy.top = accuracy.top ,accuracy.bottom = accuracy.bottom,accuracy.both = accuracy.both, testing_ratio, MSE = MSE)
+  evaluation.result = list(predictions.all,performance.result)
+  return(evaluation.result)
+}
+
+```
+### Run Lasso regression analysis between top Gene (91 genes) and PCB concentrations  
+</br>
+
+Run lasso analysis with leave one site out cross validatino with 40 rounds, 40 * 31 sites = 1240 cross-validation and resample 90% of training individuals every trial.  
+
+```{r Lasso regression analysis between top Gene (~ 100 genes) and PCB concentrations, message=FALSE, warning=FALSE}
+### Total PCBs
+Con="PCBs_data";Con_ind="TOTAL PCBs"
+## refresh between chemicals 
+lamda.sequence <- {}
+Result.lasso.assessment <- {}
+variables <- {}
+predict.site.test <- {}
+## result measures 
+rlassoResult <- list()
+
+# prepare data 
+contaminants.coldata.subset2 <-contaminants.coldata.subset
+### Individual chemicals 
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% filter(Key == Con_ind)
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% filter(!is.na(value.adjust)) ## remove those with value == "NR"
+## combine all duplicated items using mean value becasue they have the same nest id 
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% group_by(MergeID,Species,Matrix,AOC,Proper_Site,Key,type,class,MergeSite,proper_site2) %>% summarise(value.adjust2 = mean(value.adjust)) %>% ungroup()
+colnames(contaminants.coldata.subset2)[colnames(contaminants.coldata.subset2) == "value.adjust2"] <- "value.adjust" ## change the name back
+# print(sum(duplicated(contaminants.coldata.subset2$MergeID))) ## check duplication again
+## read topgenelist 91 genes 
+test.genelist = readRDS("topgenelistPCBs.rds")$total.PCBs
+
+contaminant.geoMean.bysite <- data.contaminants.majorSubset.geo.bysite %>% filter(Key == Con_ind) %>% dplyr::pull(value.geoMean) %>% log10() ## log10 of contaminant value
+names(contaminant.geoMean.bysite) <- data.contaminants.majorSubset.geo.bysite %>% filter(Key == Con_ind) %>% dplyr::pull(MergeSite) 
+nestid <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(MergeID)
+match1 <- colnames(counts.tswallow.norm) %in% nestid
+counts.con  <-  counts.tswallow.norm[,match1]
+contamin.matrix <- contaminants.coldata.subset2 %>% dplyr::slice(match(colnames(counts.con), contaminants.coldata.subset2$MergeID)) %>% filter(Key == Con_ind) %>%　mutate(value.adjust.log = log10(value.adjust))
+contamin.array <- contamin.matrix$value.adjust.log
+names(contamin.array) = contamin.matrix$MergeID
+contamin.matrix.mean <- contamin.matrix %>% group_by(MergeSite) %>% summarise(geoMean = mean(value.adjust.log)) %>% ungroup()
+contamin.matrix.mean$MergeSite[31] = "NA"
+contaminant.geoMean.bysite.genomic <- contamin.matrix.mean$geoMean
+names(contaminant.geoMean.bysite.genomic) <- contamin.matrix.mean$MergeSite
+```
+
+
+```{r Run Lasso regression analysis between top Gene (~ 100 genes) and PCB concentrations, eval=FALSE}
+# Run lasso analysis with leave one site out cross validatino with 40 rounds, 40 * 31 sites = 1240 cross-validation and resample 90% of training individuals every trial. 
+print(c("2nd lasso cv",Con_ind))
+t1 =  Sys.time()
+cl <- parallel::makeCluster(12)
+doParallel::registerDoParallel(cl)
+t1 = Sys.time()
+PCBs_CV_bySite_result = Run_lasso.by.site.PCBs.top100.lasso(re = 40, Con = Con, Con_ind = Con_ind, s = 1,lam.m = -2)
+t2 =  Sys.time()
+t2 -t1
+parallel::stopCluster(cl)
+
+# Result list : 1. variables, 2.  dev.ratio 3. lamda.sequence 4. predict.all.genomic.samples.subset.lasso 5. predict.all.genomic.samples.subset.lasso.mean 6. predict.all.genomic.samples.lasso 
+# 7. predict.all.genomic.samples.lasso.mean 
+# saveRDS(PCBs_CV_bySite_result, "PCBs_CV_bySite_result2nd.rds")
+```
+
+### Lasso regression analysis results for predicting PCB concentrations 
+```{r evaluate performance, message=FALSE, warning=FALSE}
+PCBs_CV_bySite_result <- readRDS("PCBs_CV_bySite_result2nd.rds")
+# PCBs_CV_bySite_result by site
+Result = unlist(unname(PCBs_CV_bySite_result[5,])) ##  genomic samples overlapped with contaminated samples 
+PCBs.performance.bysite.overlapped.report = evaluation_funciton.bysite(Result = Result) 
+
+Result = unlist(unname(PCBs_CV_bySite_result[7,])) ## all genomic samples 
+PCBs.performance.bysite.allgenomic.report = evaluation_funciton.bysite(Result = Result) 
+# 
+# ## overlapped portion PCBs
+# $performance.result
+#  error.top    error.bottom      error.both    accuracy.top accuracy.bottom   accuracy.both       top_ratio    bottom_ratio             MSE 
+#     0.132075472     0.006072874     0.050065876     0.569811321     0.844129555     0.748353096     0.322580645     0.451612903     0.230140947 
+
+# # ## all genomic samples PCBs
+# $performance.result
+# error.top    error.bottom      error.both    accuracy.top accuracy.bottom   accuracy.both       top_ratio    bottom_ratio             MSE 
+#     0.090551181     0.006507592     0.036363636     0.614173228     0.854663774     0.769230769     0.322580645     0.451612903     0.233187702 
+
+# PCBs_CV_bySite_result by individual, only use overlapped portion 
+Result = unlist(unname(PCBs_CV_bySite_result[4,])) ##  genomic samples overlapped with contaminated samples 
+PCBs.performance.byindividual.overlapped.report = evaluation_funciton.byindividual(Result = Result) 
+
+# error.top    error.bottom      error.both    accuracy.top accuracy.bottom   accuracy.both       top_ratio    bottom_ratio             MSE 
+#       0.1002028       0.1817585       0.1452929       0.7346856       0.6286089       0.6760385       0.4234694       0.3724490       0.3985988 
+
+## other performance metrics
+# determine predictor genes; variablers
+variables.length.summary <-  summary(sapply(1:length(PCBs_CV_bySite_result[1,]), function(x) length(PCBs_CV_bySite_result[1,][[x]])))
+variables.length.p95 <- quantile(sapply(1:length(PCBs_CV_bySite_result[1,]), function(x) length(PCBs_CV_bySite_result[1,][[x]])),0.95)
+variables <- names(sort(table(names(unlist(unname(PCBs_CV_bySite_result[1,])))),decreasing = TRUE)[1:variables.length.p95])
+variables <- list(id = variables, name = na.omit(ID.convert$GeneName[match(variables,ID.convert$GeneID2)]))
+variables.coef = unlist(lapply(1:ncol(PCBs_CV_bySite_result), function(x) na.omit(PCBs_CV_bySite_result[1,][[x]][variables$id])))
+geomean_func = function(x) {exp(mean(log(x)))}
+variables.coef.aggregate = aggregate(variables.coef, list(Gene = names(variables.coef)),mean)
+colnames(variables.coef.aggregate)[2] = "coef"
+variables.coef.aggregate = data.frame(name = ID.convert$GeneName[match(variables.coef.aggregate$Gene, ID.convert$GeneID2)], variables.coef.aggregate)
+
+# R square, or deviance ratio
+
+# dev.ratio
+dev.ratio.n <- ncol(PCBs_CV_bySite_result)
+dev.ratio.mean <- mean(unlist(unname(PCBs_CV_bySite_result[2,])))
+dev.ratio.s <- sd(unlist(unname(PCBs_CV_bySite_result[2,])))
+margin <- qt(0.975,df=dev.ratio.n-1)*dev.ratio.s/sqrt(dev.ratio.n)
+dev.ratio.PCBs = c(mean = dev.ratio.mean, margin = margin)
+# print(dev.ratio.PCBs)
+# mean      margin 
+# 0.766489759 0.001045139 
+
+
+# ## 
+predict.result = unlist(unname(PCBs_CV_bySite_result[4,])) # only the overlapping part 
+predict.result2 = unlist(unname(PCBs_CV_bySite_result[5,])) # only the overlapping part site average 
+Predictions.by.site = tibble(site= names(predict.result2), predictions= predict.result2,  genomic.PCB.mean = contaminant.geoMean.bysite.genomic[names(predict.result2)], proper_site2 = siteMAP.all$propersite[match(names(predict.result2), siteMAP.all$SiteID)])
+Predictions.by.individual = tibble(MergeID = names(predict.result), proper_site2 = siteMAP.all$propersite[match(str_sub(names(predict.result),3,4), siteMAP.all$SiteID)], predicted.PCBs = predict.result,  measured.PCBs = contamin.array[names(predict.result)])
+PCBs.predictions.lasso.aggregate = list(by.site = Predictions.by.site, by.individual = Predictions.by.individual)
+# saveRDS(PCBs.predictions.lasso.aggregate, "PCBs.predictions.lasso.aggregate.rds")  
+
+# list all predictions, variables, R2 and model performance 
+PCBs.performance.report <- list(PCBs.performance.bysite.overlapped.report = PCBs.performance.bysite.overlapped.report, PCBs.performance.bysite.allgenomic.report = PCBs.performance.bysite.allgenomic.report, PCBs.performance.byindividual.overlapped.report = PCBs.performance.byindividual.overlapped.report, PCB.variables = list(variables,variables.coef.aggregate), PCBs.dev.ratio = dev.ratio.PCBs)
+# saveRDS(PCBs.performance.report, "PCBs.performance.report.rds")
+
+```
+</br>
+Because not evey nest was selected for measuring chemistry, the following performance metrics are calculated by   
+
+- PCBs_CV_bySite_result by site: only include those nest with chemistry measurements and calculate accuracy and errors using predicted site geometric mean  
+- PCBs.performance.bysite.allgenomic: include all nest with or without chemistry measurements and calculate accuracy and errors using predicted site geometric mean 
+- PCBs.performance.byindividual: include all nest with chemistry measurements and calculate accuracy and errors using predicted individual concentrations. 
+
+```{r construct performance.metrics, message=FALSE, warning=FALSE}
+Result = unlist(unname(PCBs_CV_bySite_result[5,])) ##  genomic samples overlapped with contaminated samples 
+PCBs.performance.bysite.overlapped.report = evaluation_funciton.bysite(Result = Result) 
+
+Result = unlist(unname(PCBs_CV_bySite_result[7,])) ## all genomic samples 
+PCBs.performance.bysite.allgenomic.report = evaluation_funciton.bysite(Result = Result) 
+# 
+# ## overlapped portion PCBs
+# $performance.result
+# error.top    error.bottom    accuracy.top accuracy.bottom   accuracy.both       top_ratio    bottom_ratio             MSE
+# 0.111969112     0.004056795     0.583011583     0.845841785     0.755319149     0.322580645     0.451612903     0.229426453
+# ## all genomic samples PCBs
+# $performance.result
+# error.top    error.bottom    accuracy.top accuracy.bottom   accuracy.both       top_ratio    bottom_ratio             MSE
+# 0.065306122     0.004347826     0.632653061     0.847826087     0.773049645     0.322580645     0.451612903     0.232414433
+
+# PCBs_CV_bySite_result by individual, only use overlapped portion 
+Result = unlist(unname(PCBs_CV_bySite_result[4,])) ##  genomic samples overlapped with contaminated samples 
+PCBs.performance.byindividual.overlapped.report = evaluation_funciton.byindividual(Result = Result) 
+
+# error.top    error.bottom    accuracy.top accuracy.bottom   accuracy.both       top_ratio    bottom_ratio             MSE 
+# 0.1002028       0.1817585       0.7346856       0.6286089       0.6760385       0.4234694       0.3724490       0.3985988 
+
+performance.metrics <- round(data.frame(PCBs.performance.bysite.overlapped.report$performance.result, PCBs.performance.bysite.allgenomic.report$performance.result, PCBs.performance.byindividual.overlapped.report[[2]]),3)
+colnames(performance.metrics) <- c("by.site (with chemistry only)", "by.site (all genomic samples)", "by.nest (with chemistry only)")
+# saveRDS(performance.metrics, "PCB.performance.metrics.rds")
+
+```
+</br>
+
+### PCBs lasso prediction results {.tabset}
+- Predicted vs actural yy plot by site  
+: predicted vs actural PCB concentration; color by those site with prediction value above or below top 1/3 or bottom 1/3 PCB among all the sites 
+
+- Predicted vs actural yy plot by site with 99.9% confidence interval  
+: add 99.9% CI on Predicted vs actural yy plot by site  
+
+- Remediation effectiveness evaluation in Waukegan  
+: add Waukegan value throughout the year on Predicted vs actural yy plot by site  
+
+- Predicted vs actural yy plot by nest  
+: the model is trained by individual nest  
+
+- model performance  
+: accuracy and error ; accurate predicting top 1/3 or bottom 1/3 ; error : predicting top 1/3 but end up bottom 1/3 or vice versa
+
+- Predictor genes selected in the model  
+: list the predictor genes in the model 
+
+
+#### Predicted vs actural yy plot by site 
+```{r Predicted vs actural yy plot by site, fig.width=6, fig.height=5, fig.cap = "Predicted vs actural PCB concentrations yy plot by site" , echo=FALSE}
+##Figure S2a PCBs yy plot 
+plot_data <- readRDS("PCBs.predictions.lasso.aggregate.rds")
+plot_data2 <- plot_data$by.site
+plot_data2 <- plot_data2 %>% group_by(proper_site2) %>% summarise(predictions = mean(predictions), geometric.mean = mean(genomic.PCB.mean)) %>% ungroup()
+plot_data2$percentile <- "M"
+plot_data2$percentile[plot_data2$predictions <= 2.26] <- "L"
+plot_data2$percentile[plot_data2$predictions >= 2.715] <- "H"
+
+# Scatterplot
+yyplot.bysite <- ggplot(plot_data2, aes(x=predictions, y=geometric.mean)) +
+  geom_point(aes(col = percentile)) +
+  labs(y="log10 Total PCBs (ng/g wet weight)",
+       x="Predicted log10 Total PCBs (ng/g wet weight)",
+       title="")+
+  stat_cor(method = "spearman", label.x = 1.75, label.y = 3.5, cor.coef.name = "rho", size = 2.5) +
+  stat_cor(method = "pearson", label.x = 1.75, label.y = 3.4, cor.coef.name = "R" , size = 2.5) +
+  geom_text(aes(1.75, 3.6, hjust = 0, label = paste0("MSE"," = " ,round(performance.metrics$`by.site (with chemistry only)`[9],digits = 3)) ), size = 2.5) +
+  scale_color_manual(name="Predicted [PCBs]", 
+                     labels = c("above 67th", "middle", "below 33rd"), 
+                     values = c("H"="red", "M" = "lightgray", "L"="blue")) +
+  geom_hline(yintercept=2.26, linetype="dashed", color = "blue") +
+  geom_hline(yintercept=2.715, linetype="dotted", color = "red")+
+  geom_text(aes(3.15, 2.05, label = "33rd percentile", vjust = - 1), color = "blue") +
+  geom_text(aes(3.15, 2.75, label = "67th percentile", vjust = - 1), color = "red") +
+  geom_vline(xintercept=2.26, linetype="dotdash", color = "blue")+
+  geom_vline(xintercept=2.715, linetype="dotdash", color = "red")+
+  theme_bw(base_size = 11)
+yyplot.bysite
+```
+#### Predicted vs actural yy plot by site with 99.9% confidence interval 
+
+```{r Predicted vs actural yy plot by site with 0.999 confidence interval, fig.width=5, fig.height=5, echo=FALSE}
+
+##Figure S2a.2 PCBs yy plot 
+
+plot_data <- readRDS("PCBs.predictions.lasso.aggregate.rds")
+plot_data2 <- plot_data$by.site
+plot_data2 <- plot_data2 %>% group_by(proper_site2) %>% summarise(predictions = mean(predictions), geometric.mean = mean(genomic.PCB.mean)) %>% ungroup()
+
+fit.PCB <- lm(geometric.mean ~ predictions, data = plot_data2)
+dat <- predict(fit.PCB, interval="confidence", level = 0.999)
+plot_data2$inside <- ifelse(plot_data2$geometric.mean < dat[,"upr"] & plot_data2$geometric.mean > dat[,"lwr"], "in", "out")
+
+# plot_data2$str <- "C"
+# plot_data2$str[plot_data2$inside == "out" & plot_data2$geometric.mean < 2.26] <- "L"
+# plot_data2$str[plot_data2$inside == "out" & plot_data2$geometric.mean > 2.715] <- "H"
+
+# 
+# yyplot.bysite1_1 <- ggplot(plot_data2, aes(x=predictions, y=geometric.mean)) +
+#   geom_point(aes(col = str),  show.legend = FALSE) +
+#   scale_color_manual(name="", 
+#                      labels = c("I", "", "II"), 
+#                      values = c("H"="red", "C" = "dark gray", "L"="blue")) +
+#   labs(y="log10 Total PCBs (ng/g wet weight)",
+#        x="Predicted log10 Total PCBs (ng/g wet weight)",
+#        title="")+
+#   # geom_text_repel(data = plot_data2[plot_data2$str == "c",], aes(label = proper_site2, x= predictions, y= geometric.mean))+
+#   geom_text_repel(data = plot_data2, aes(label = proper_site2, x=predictions, y=geometric.mean)) +
+#   geom_label(x=2.2, y=3.6, label="I", size = 10, color = "red", label.padding = unit(0.55, "lines")) + 
+#   geom_label(x=2.8, y=1.5, label="II", size = 10, color = "blue", label.padding = unit(0.55, "lines") # Rectangle size around label
+#              ) + 
+#   # stat_cor(method = "spearman", label.x = 1.75, label.y = 3.7, cor.coef.name = "rho", size = 2.5) +
+#   # stat_cor(method = "pearson", label.x = 1.75, label.y = 4, cor.coef.name = "R" , size = 3.5, color = "red") +
+#   # geom_text(aes(1.75, 3.8, hjust = 0, label = paste0("MSE"," = " ,round(performance.metrics$`by.site (with chemistry only)`[9],digits = 3)) ), size = 2.5) +
+#   geom_smooth(method=lm, color='gray', fill='lightblue', level=0.999, formula = "y ~ x") +
+#   theme_classic(base_size = 11)
+
+# 
+# # Scatterplot
+yyplot.bysite2.1 <- ggplot(plot_data2, aes(x=predictions, y=geometric.mean)) +
+  geom_point(aes(col = inside),  show.legend = FALSE) +
+  scale_color_manual(name="",
+                     labels = c("out", "in"),
+                     values = c("out"="red", "in"="gray")) +
+  labs(y="log10 Total PCBs (ng/g wet weight)",
+       x="Predicted log10 Total PCBs (ng/g wet weight)",
+       title="")+
+  # geom_text_repel(data = plot_data2[!plot_data2$str == "C",], aes(label = proper_site2, x=predictions, y=geometric.mean)) +
+  geom_smooth(method=lm, color='gray', fill='lightblue', level=0.999, formula = "y ~ x") +
+  # geom_smooth(method="loess", color='gray', fill='lightblue', level=0.95, formula = "y ~ x") +
+  theme_classic(base_size = 11)
+
+yyplot.bysite2.2 <- ggplot(plot_data2, aes(x=predictions, y=geometric.mean)) +
+  geom_point(aes(col = inside),  show.legend = FALSE) +
+  scale_color_manual(name="",
+                     labels = c("out", "in"),
+                     values = c("out"="red", "in"="gray")) +
+  labs(y="log10 Total PCBs (ng/g wet weight)",
+       x="Predicted log10 Total PCBs (ng/g wet weight)",
+       title="")+
+  geom_text_repel(data = plot_data2, aes(label = proper_site2, x=predictions, y=geometric.mean)) +
+  geom_smooth(method=lm, color='gray', fill='lightblue', level=0.999, formula = "y ~ x") +
+  theme_classic(base_size = 11)
+
+
+
+yyplot.bysite2.1
+
+
+
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure_pending_PCBs_discusscomplexmixture.tiff", units="in", pointsize = 10, width=6, height=6, res=300, compression = 'lzw')
+# yyplot.bysite2.1
+# dev.off()
+# 
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure_pending_PCBsv2_discusscomplexmixture.tiff", units="in", pointsize = 10, width=6, height=6, res=300, compression = 'lzw')
+# yyplot.bysite2.2
+# dev.off()
+
+
+```
+
+#### Remediation effectiveness evaluation in Waukegan
+
+```{r check remediation status, fig.width=7, fig.height=6, echo=FALSE, message=FALSE}
+plot_data <- readRDS("PCBs.predictions.lasso.aggregate.rds")
+plot_data2 <- plot_data$by.site
+plot_data2 <- plot_data2 %>% group_by(proper_site2) %>% summarise(predictions = mean(predictions), geometric.mean = mean(genomic.PCB.mean)) %>% ungroup()
+plot_data2.RM.wk <- plot_data2[!plot_data2$proper_site2 == "Waukegan",]
+plot_data3 <- plot_data$by.individual
+plot_data3.wk <-  plot_data3[plot_data3$proper_site2 == "Waukegan",] %>% group_by(MergeID ) %>% summarise(predictions = mean( predicted.PCBs), actural = mean(measured.PCBs)) %>% ungroup()
+plot_data3.wk$year <- paste0("20",str_sub(plot_data3.wk$MergeID, 1,2))
+plot_data3.wk$year[plot_data3.wk$year %in% c("2010","2011","2012")] <- "Before 2013"
+plot_data3.wk$remediation <- "After dredging"
+plot_data3.wk$remediation[plot_data3.wk$year == "2013"] <- "Year of dredging"
+plot_data3.wk$remediation[plot_data3.wk$year == "Before 2013"] <- "Before dredging"
+plot_data3.wk2 <- plot_data3.wk %>% group_by(year) %>% summarise(predictions = mean(predictions), actural = mean(actural), remediation = remediation) %>% ungroup() %>% distinct()
+
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+## lm regression fit line for plotting arrow 
+fit.PCB.wk <- lm(actural  ~ predictions, data = plot_data3.wk)
+dat.wk <- predict(fit.PCB.wk)
+
+yyplot.bysite.remediation <- ggplot(plot_data2, aes(x=predictions, y=geometric.mean)) +
+  geom_point(data= plot_data3.wk2, aes(x=predictions , y=actural, shape = remediation), size = 3) +
+  geom_text_repel(data= plot_data3.wk2, aes(label = year, x=predictions , y=actural), size = 3) + 
+  scale_shape_manual(values= c(15,16,17), breaks = c("Before dredging", "Year of dredging", "After dredging"), 
+                     labels = c("Before dredging", "Year of dredging", "After dredging")) + 
+  labs(y="log10 Total PCBs (ng/g wet weight)", x="Predicted log10 Total PCBs (ng/g wet weight)",title="")+
+  geom_smooth(method=lm, color='gray', fill='lightgray', level=0.999, formula = "y ~ x") +
+  theme_classic(base_size = 11)
+
+yyplot.bysite.remediation
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure_pending_PCBs_yyplot.remediation.tiff", units="in", pointsize = 10, width=6, height=6, res=300, compression = 'lzw')
+# yyplot.bysite.remediation
+# dev.off()
+
+```
+
+#### Predicted vs actural yy plot by nest
+```{r Predicted vs actural yy plot by nest, fig.width=6, fig.height=6, echo=FALSE}
+##Figure S2a PCBs yy plot 
+plot_data <- readRDS("PCBs.predictions.lasso.aggregate.rds")
+plot_data <- plot_data$by.individual %>% group_by(MergeID) %>% summarise(predictions = mean(predicted.PCBs), actural = mean(measured.PCBs)) %>% ungroup()
+# Scatterplot
+yyplot.bynest <- ggplot(plot_data, aes(x=predictions , y=actural)) +
+  geom_point() +
+  labs(y="log10 Total PCBs (ng/g wet weight)",
+       x="Predicted log10 Total PCBs (ng/g wet weight) ",
+       title="")+
+  stat_cor(method = "spearman", label.x = 1, label.y = 3.8, cor.coef.name = "rho", size = 2.5) +
+  stat_cor(method = "pearson", label.x = 1, label.y = 3.6, cor.coef.name = "R" , size = 2.5) +
+  geom_text(aes(1, 4, hjust = 0, label = paste0("MSE"," = " ,round(performance.metrics$`by.nest (with chemistry only)`[9],digits = 3))), size = 2.5) +
+  theme_bw(base_size = 8)
+yyplot.bynest
+
+```
+
+#### model performance
+```{r show table, echo=FALSE}
+performance.metrics <- readRDS("/home/chiyen/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/PCB.performance.metrics.rds")
+knitr::kable(performance.metrics, caption = "PCBs lasso regression model performance metrics")
+```
+
+#### Predictor genes selected in the model   
+
+```{r dev.ratio, echo=FALSE}
+knitr::kable(PCBs.performance.report$PCB.variables[[2]][,c(1,3,2)], "simple", caption = "PCBs top predictor genes and coefficient", align = "lcc")
+```
+```{r PCB MSE by sample size, include=FALSE}
+## then calcuate MSE and RMSE sites_verifications = c("WK","HW","SP")
+Con="PCBs_data";Con_ind="TOTAL PCBs"
+contaminant.geoMean.bysite <- data.contaminants.majorSubset.geo.bysite %>% filter(Key == Con_ind) %>% dplyr::pull(value.geoMean) %>% log10() ## log10 of contaminant value
+names(contaminant.geoMean.bysite) <- data.contaminants.majorSubset.geo.bysite %>% filter(Key == Con_ind) %>% dplyr::pull(MergeSite) 
+nestid <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(MergeID)
+match1 <- colnames(counts.tswallow.norm) %in% nestid
+counts.con  <-  counts.tswallow.norm[,match1]
+contamin.matrix <- contaminants.coldata.subset2 %>% dplyr::slice(match(colnames(counts.con), contaminants.coldata.subset2$MergeID)) %>% filter(Key == Con_ind) %>%　mutate(value.adjust.log = log10(value.adjust))
+contamin.array <- contamin.matrix$value.adjust.log
+names(contamin.array) = contamin.matrix$MergeID
+contamin.matrix.mean <- contamin.matrix %>% group_by(MergeSite) %>% summarise(geoMean = mean(value.adjust.log)) %>% ungroup()
+contamin.matrix.mean$MergeSite[31] = "NA"
+contaminant.geoMean.bysite.genomic <- contamin.matrix.mean$geoMean
+names(contaminant.geoMean.bysite.genomic) <- contamin.matrix.mean$MergeSite
+test.result =which(str_sub(names(sapply(1:1240, function(x) unname(PCBs_CV_bySite_result[4,])[[x]][1])),3,4) %in% c("WK","HW","SP")) # select those individuals in WK HW SP 
+Result = unname(PCBs_CV_bySite_result[4,])[test.result] ## 120 total
+
+
+WK.mse.all <- {}
+SP.mse.all <- {}
+HW.mse.all <- {}
+for (k in 1:100) {
+## randomly select 3 to 10 individuals to calculate MSE
+predictions.by.size <- {}
+output.all <- list()
+for (j in rep(3:10, each=10)) {
+  predictions.mean.all <- {}
+  for (i in 1:120) {
+  predictions.mean = mean(sample(Result[[i]],j))
+  predictions.mean.all = c(predictions.mean.all, predictions.mean)
+  output = list(names(sample(Result[[i]],j)))
+  output.all = c(output.all, output)
+  }
+  predictions.mean.all2 = data.frame(value = predictions.mean.all, size = j, site = rep(c("WK","SP","HW"), each = 40))
+  predictions.by.size = rbind(predictions.by.size, predictions.mean.all2)
+}
+}
+## geoMean: only use overlapped genomic site individulas training samples to calculate geoMean
+predictions2 = cbind(as_tibble(predictions.by.size), actural.mean = contaminant.geoMean.bysite.genomic[predictions.by.size$site]) # prediction and measured geometric mean by size
+predictions3 = predictions2 %>% mutate(delta.square = (value - actural.mean)^2) %>% group_by(size, site) %>% summarise(MSE = mean(delta.square)) # calculate MSE
+predictions4 = as.data.frame(predictions3)
+predictions4$size = as.factor(predictions4$size)
+predictions4 = predictions4 %>% group_by(site) %>% mutate(MSE.norm = as.numeric(scale(MSE))) %>% ungroup() # normalized z-score MSE
+predictions4$size = as.numeric(predictions4$size)
+predictions4$propersite = "NA"
+predictions4$propersite[predictions4$site == "HW"] = "ZugIsland"
+predictions4$propersite[predictions4$site == "SP"] = "RiverRaisin"
+predictions4$propersite[predictions4$site == "WK"] = "Waukegan"
+
+## find elbow sample size 
+get.elbow.points.indices <- function(x, y, threshold) {
+  d1 <- diff(y) / diff(x) # first derivative
+  d2 <- diff(d1) / diff(x[-1]) # second derivative
+  indices <- which(abs(d2) > threshold)  
+  return(indices)
+}
+
+loess.samplesize = loess(MSE.norm~size, data = predictions4)
+smoothed <- predict(loess.samplesize)
+smoothed <- smoothed[!duplicated(smoothed)]
+
+# first approximate the function, since we have only a few points
+x <- 1:8
+y <- smoothed
+ap <- approx(x, y, n=1000, yleft=min(y), yright=max(y))
+x = ap$x
+y = ap$y
+indices <- get.elbow.points.indices(x, y, 20)# threshold for huge jump = 1e4
+x[indices]
+#[1] 4.99 # there is one such point
+plot(x, y, pch=19)
+points(x[indices], y[indices], pch=19, col='red') ## pick the second one
+
+# saveRDS(predictions4, "/home/chiyen/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/samplesize_vs_MSE_by_site.plotdatav2.rds")
+
+```
+#### MSE by sample size 
+```{r MSE by sample size, echo=FALSE, fig.width=6, fig.height=5, message=FALSE}
+predictions4 <- readRDS("samplesize_vs_MSE_by_site.plotdatav2.rds")
+MSE_samplesize_plot1 <- ggplot(data=predictions4, aes(x=size, y=MSE.norm)) +
+  geom_point(aes(shape = propersite), size = 1)+
+  geom_smooth(method="loess")+
+  guides(color=guide_legend(title="site"),shape=guide_legend(title="sample size"))+
+  geom_vline(xintercept = 4.99, linetype="dotted")+
+  theme_classic(base_size = 12)
+
+MSE_samplesize_plot1
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure6_MSE_samplesize_plotV2.tiff", units="in", width=5, height=4, res=300, compression = 'lzw') 
+# MSE_samplesize_plot1
+# dev.off()
+```
+
+### PCBs top gene predictors functions and pathways  {.tabset}
+
+PCBs top predictor genes heatmap  
+: correlation between PCB concentration, top predictor gene logFC, top predictor gene model coef. , top predictor gene up or downregulated and their corresponding Reactome pathways  
+
+PCBs lasso selected genes heatmap deatil functions and pathways  
+: detail GO terms and Reactome pathways
+
+PCB correlation between logFC logCPM and model coef  
+: the correlation between top predictor genes between logFC, logCPM (counts), and PCB model coef. measured in top 1/3 logFC individuals 
+
+```{r PCBs functions heatmap data processing, include=FALSE}
+## editting go and reactome terms 
+
+## load function/ pathway expalanation 
+library(xml2)
+PCBs_bp.data.raw <- read_xml("PCBs_2ndLasso_funcionts.xml") ## from  PANTHER17.0 add citation https://academic.oup.com/nar/article/49/D1/D394/6027812?login=false
+id = xml_text(xml_find_all(PCBs_bp.data.raw, "//result/term/id"))
+term = xml_text(xml_find_all(PCBs_bp.data.raw, "//result/term/label"))
+number_in_list = as.numeric(xml_text(xml_find_all(PCBs_bp.data.raw, "//result/input_list/number_in_list")))
+number_in_reference = as.numeric(xml_text(xml_find_all(PCBs_bp.data.raw, "//result/number_in_reference")))
+pValue = as.numeric(xml_text(xml_find_all(PCBs_bp.data.raw, "//pValue")))
+fold_enrichment = as.numeric(xml_text(xml_find_all(PCBs_bp.data.raw, "//fold_enrichment")))
+quest.id = lapply(1:11208, function(x) paste0("result[", x, "]/input_list/mapped_id_list/mapped_id"))
+mapped_id = lapply(1:11208, function(x) xml_text(xml_find_all(PCBs_bp.data.raw, quest.id[[x]])))
+mapped_id = mapped_id[-17]
+names(mapped_id) = id
+
+table.panther = tibble(term = term, number_in_list = number_in_list, number_in_reference = number_in_reference, pValue = pValue, fold_enrichment = fold_enrichment)
+## remove UNCLASSIFIED
+table.panther = table.panther[-17,]
+## remove fold enrichment = 0 
+table.panther = tibble(id = id , table.panther)
+table.panther = table.panther %>% filter(fold_enrichment > 0)
+PCBs_bp.panther = table.panther
+PCBs_bp.panther.mapped_id = mapped_id[PCBs_bp.panther$id]
+
+## check lasso selected PAHs related genes funcions and plot as heatmap 
+PCBs_bp.panther.trim = PCBs_bp.panther %>% filter(number_in_reference < 4000 & number_in_reference > 30) %>%  filter(number_in_list  > 2)  # pick 4000 and 30 for more common terms for classification
+
+Revigo_pcb_trim_list <- read.table("Revigo_BP_OnScreenTable.tsv") # doi:10.1371/journal.pone.0021800, using small,  remove obsolete GO terms: YES, work with gallus gallus 9031, semantic similarity measure default setting
+colnames(Revigo_pcb_trim_list) = Revigo_pcb_trim_list[1,]
+Revigo_pcb_trim_list = as_tibble(Revigo_pcb_trim_list[-1,]) %>% top_n(-30, Dispensability) # pick top 30 terms after using Revigo 
+Revigo_pcb_trim_list <- Revigo_pcb_trim_list$TermID
+PCBs_bp.panther.trim = PCBs_bp.panther.trim %>% filter(id %in% Revigo_pcb_trim_list)
+
+PCBs_bp.panther.mapped_id$all = unique(na.omit(variables.coef.aggregate$name))
+PCBs_bp.panther.data = unlist(PCBs_bp.panther.mapped_id)
+names(PCBs_bp.panther.data) = str_sub(names(PCBs_bp.panther.data), 1,10)
+names(PCBs_bp.panther.data)[grep("all",names(PCBs_bp.panther.data))] = "all"
+PCBs_bp.panther.data = data.frame(GOBP_ID = names(PCBs_bp.panther.data), name = PCBs_bp.panther.data)
+PCBs_bp.panther.data = dplyr::left_join(PCBs_bp.panther.data, variables.coef.aggregate)
+PCBs_bp.panther2 = PCBs_bp.panther
+colnames(PCBs_bp.panther2)[1] = "GOBP_ID"
+PCBs_bp.panther.data = dplyr::left_join(PCBs_bp.panther.data, PCBs_bp.panther2)
+
+PCBs.bp.select = c("all", PCBs_bp.panther.trim$id)
+
+PCBs_bp.panther.data$term[PCBs_bp.panther.data$GOBP_ID == "all"] = "all"
+data <- as_tibble(PCBs_bp.panther.data[,c(1,2,4,5)])
+data <- pivot_wider(data, names_from = "name",values_from = "coef")
+data <- data %>% filter(GOBP_ID %in% PCBs.bp.select)
+data.matrix = data[,3:51]
+# data.matrix[is.na(data.matrix)] = 0
+data.matrix = as.matrix(data.matrix)
+row.names(data.matrix) = data$term
+data.matrix[is.na(data.matrix)] = 0
+GOBP_data.matrix = data.matrix
+
+## load PCBs pathway  
+library(xml2)
+library(dplyr)
+PCBs_reactome.data.raw <- read_xml("PCBs_2ndLasso_pathways.xml") ## from  PANTHER17.0 add citation https://academic.oup.com/nar/article/49/D1/D394/6027812?login=false
+id = xml_text( xml_find_all( PCBs_reactome.data.raw, "//term/id" ) )
+label = xml_text( xml_find_all( PCBs_reactome.data.raw, "//term/label" ) )
+number_in_reference = xml_text( xml_find_all( PCBs_reactome.data.raw, "//number_in_reference" ))
+number_in_list = xml_text( xml_find_all( PCBs_reactome.data.raw, "//number_in_list" ))
+pValue = xml_text( xml_find_all( PCBs_reactome.data.raw, "//pValue" ))
+fold_enrichment = xml_text( xml_find_all( PCBs_reactome.data.raw, "//fold_enrichment" ))
+quest.list = lapply(1:1631, function(x) paste0("result[", x, "]/input_list/mapped_id_list/mapped_id"))
+mapped_id =   lapply(1:1631, function(x) xml_text( xml_find_all( PCBs_reactome.data.raw, quest.list[[x]])))
+mapped_id = mapped_id[-1]
+names(mapped_id) = id
+
+PCBs_reactome.data = data.frame(label = label,number_in_reference=as.numeric(number_in_reference), number_in_list=as.numeric(number_in_list),pValue=as.numeric(pValue),fold_enrichment=as.numeric(fold_enrichment))[-1,]
+PCBs_reactome.data = cbind(id = id , PCBs_reactome.data)
+PCBs_reactome.data = as_tibble(PCBs_reactome.data)
+PCBs_reactome.data = PCBs_reactome.data %>% filter(fold_enrichment > 0) %>% filter(number_in_list > 1) ## filter out emply cells and only one hit result
+PCBs_reactome.data.mapped_id = mapped_id[PCBs_reactome.data$id]
+PCBs_reactome.data.mapped_id$all = unique(na.omit(variables.coef.aggregate$name)) ## add all row
+
+PCBs_reactome.data.mapped.data = unlist(PCBs_reactome.data.mapped_id)
+names(PCBs_reactome.data.mapped.data) = str_remove(names(PCBs_reactome.data.mapped.data), "\\d$") 
+names(PCBs_reactome.data.mapped.data)[grep("all",names(PCBs_reactome.data.mapped.data))] = "all"
+names(PCBs_reactome.data.mapped.data)[names(PCBs_reactome.data.mapped.data) == "R-GGA-1625821" ] = "R-GGA-162582"
+
+PCBs_reactome.panther.data = data.frame(Reactome_ID = names(PCBs_reactome.data.mapped.data), name = PCBs_reactome.data.mapped.data)
+PCBs_reactome.panther.data = dplyr::left_join(PCBs_reactome.panther.data, variables.coef.aggregate)
+PCBs_reactome.panther2 = PCBs_reactome.data[,1:5]
+colnames(PCBs_reactome.panther2)[1] = "Reactome_ID"
+PCBs_reactome.panther.data = dplyr::left_join(PCBs_reactome.panther.data, PCBs_reactome.panther2)
+
+PCBs_reactome.panther.data$label[PCBs_reactome.panther.data$Reactome_ID == "all"] = "all"
+data <- as_tibble(PCBs_reactome.panther.data[,c(1,2,4,5)])
+data <- pivot_wider(data, names_from = "name",values_from = "coef")
+data.matrix = data[,3:51]
+# data.matrix[is.na(data.matrix)] = 0
+data.matrix = as.matrix(data.matrix)
+row.names(data.matrix) = data$label
+data.matrix[is.na(data.matrix)] = 0
+Reactome_data.matrix = data.matrix
+
+PCBs_lasso_by_site_50_functional_data = list(panther_result = PCBs_bp.panther, gene_mapped_panther_result = PCBs_bp.panther.data, heatmap.bp.plot.data = GOBP_data.matrix, 
+                                             heatmap.reactome.plot.data = Reactome_data.matrix, top_go_terms = PCBs.bp.select)
+# saveRDS(PCBs_lasso_by_site_50_functional_data,  "PCBs_lasso_by_site_50_functional_data.rds")
+
+
+## making heatmap data (logFC, PCBs concentration, PCB coef )
+Con="PCBs_data";Con_ind="TOTAL PCBs"
+siteMAP.all2 = siteMAP.all %>% distinct()
+siteMAP.all2 = siteMAP.all2 %>% mutate(AOC_name = contaminants.coldata.subset2$AOC[match(as.character(siteMAP.all2$SiteID), contaminants.coldata.subset2$MergeSite)])
+siteMAP.all2$AOC_name[siteMAP.all2$SiteID == "NA"] <- "MilwaukeeEstuary"
+siteMAP.all2 = siteMAP.all2[!is.na(siteMAP.all2$AOC_name),]
+siteMAP.all2$AOC_name[siteMAP.all2$AOC_name == "."] = "Ref"
+siteMAP.all2$AOC_name[grep("Non",siteMAP.all2$AOC_name)] = "Non-AOC"
+nestid <- contaminants.coldata.subset2 %>% filter(Key == Con_ind) %>% dplyr::pull(MergeID)
+match1 <- colnames(counts.tswallow.norm) %in% nestid
+## counts data for PCBs
+counts.con  <-  counts.tswallow.norm[,match1]
+
+counts.con.subset <- counts.con[PCBs.performance.report[[4]][[2]][,2][!is.na(PCBs.performance.report[[4]][[2]][,1])],] # select those with proper gene name 
+row.names(counts.con.subset) <- as.character(na.omit(PCBs.performance.report[[4]][[2]][,1])) # rename to proper genen name
+## make matrix 
+counts.con.subset.matrix <- as.matrix(counts.con.subset)
+counts.con.subset.site <-  siteMAP.all$propersite[match(str_sub(colnames(counts.con.subset.matrix),3,4), siteMAP.all$SiteID)]
+counts.con.subset.AOC <- siteMAP.all2$AOC_name[match(counts.con.subset.site,siteMAP.all2$propersite)]
+
+contaminant.geoMean = contaminant.geoMean.bysite.genomic
+names(contaminant.geoMean) = siteMAP.all2$propersite[match(names(contaminant.geoMean), siteMAP.all2$SiteID)]
+
+counts.con.subset.sitePCBlabel <- contaminant.geoMean[counts.con.subset.site]
+names(counts.con.subset.sitePCBlabel) <- counts.con.subset.site
+counts.con.subset.sitePCBlabel[counts.con.subset.sitePCBlabel < 2.264] <- "< 33th percentile"  
+counts.con.subset.sitePCBlabel[counts.con.subset.sitePCBlabel > 2.715] <- "> 67th percentile"
+counts.con.subset.sitePCBlabel[counts.con.subset.AOC == "Non-AOC"] <- "Non-AOC"
+counts.con.subset.sitePCBlabel[counts.con.subset.AOC == "Ref"] <- "Ref"
+counts.con.subset.sitePCBlabel[grep("\\.",counts.con.subset.sitePCBlabel)] <- "33 - 67 percentile"
+counts.con.subset.sitePCBlabel <- factor(counts.con.subset.sitePCBlabel, levels = c("> 67th percentile","33 - 67 percentile","< 33th percentile" ,"Non-AOC", "Ref"))
+
+## matching PCBs data 
+contamin.matrix <- contaminants.coldata.subset2 %>% dplyr::slice(match(colnames(counts.con), contaminants.coldata.subset2$MergeID)) %>% filter(Key == Con_ind) %>%　mutate(value.adjust.log = log10(value.adjust))
+contamin.array <- contamin.matrix$value.adjust.log
+contamin.array.order <- order(contamin.array)
+names(contamin.array) = contamin.matrix$MergeID
+```
+
+#### PCBs top predictor genes heatmap
+
+```{r PCBs top predictor genes heatmap, message=FALSE, echo=FALSE, fig.width=9, fig.height=10}
+Reactome.PCBs.subset = c("Signal Transduction" , "Metabolism of lipids" , "Immune System" , "Cardiac conduction", "Hemostasis")
+Reactome_data.matrix.t = t(Reactome_data.matrix[,colnames(GOBP_data.matrix)])
+
+heatmap.anno = as.data.frame(Reactome_data.matrix.t[row.names(counts.con.subset.matrix),Reactome.PCBs.subset]) # make row annotaion from lasso coef and reactome pathways 
+heatmap.anno[heatmap.anno > 0] <- "up"
+heatmap.anno[heatmap.anno < 0] <- "down"
+heatmap.anno[heatmap.anno == 0] <- NA
+heatmap.anno <- cbind(PCB.coef = Reactome_data.matrix.t[row.names(counts.con.subset.matrix),"all"], heatmap.anno)
+heatmap.anno$`Signal Transduction` <- as.factor(heatmap.anno$`Signal Transduction`)
+heatmap.anno$`Metabolism of lipids` <- as.factor(heatmap.anno$`Metabolism of lipids`)
+heatmap.anno$`Immune System` <- as.factor(heatmap.anno$`Immune System`)
+heatmap.anno$`Cardiac conduction` <- as.factor(heatmap.anno$`Cardiac conduction`)
+heatmap.anno$Hemostasis <- as.factor(heatmap.anno$Hemostasis)
+
+library(circlize)
+library(dendsort)
+col_fun = colorRamp2(c(-0.2, 0, 0.2), c("blue", "white", "red"))
+
+
+## figure PCBs_lasso50_heatmap.v4
+## normalized by starlake average counts
+counts.con.subset.matrix.corrected = counts.con.subset.matrix - rowMeans(counts.con.subset.matrix[,grep("SL", colnames(counts.con.subset.matrix))])
+# row_dend = dendsort(hclust(dist(counts.con.subset.matrix.corrected), method = "ward.D2"))
+col_dend = dendsort(hclust(dist(t(counts.con.subset.matrix.corrected), method = "euclidean"), method = "complete"))
+rows.cor <- dendsort(hclust(as.dist(1- cor(t(counts.con.subset.matrix.corrected), use = "pairwise.complete.obs", method = "pearson")), method = "complete"), isReverse = TRUE)
+
+## add expression 
+heatmap.anno2 = heatmap.anno
+heatmap.anno2$expression = rowMeans(counts.con.subset.matrix)
+heatmap.anno2 = heatmap.anno2[,c(1,7,2,3,4,5,6)]
+
+lgd = Legend(title = "Reactome pathways", legend_gp  = gpar(fill = c("red","blue")), 
+                      labels = c("up", "down"))
+PCBs_lasso50_heatmap.v4 <-
+  Heatmap(t(counts.con.subset.matrix.corrected), name = "logFC", cluster_columns = rows.cor, cluster_rows = col_dend, show_row_names = FALSE, column_names_gp = gpar(fontsize = 8),
+          column_title = "", left_annotation = rowAnnotation(`[PCBs]` = anno_points(contamin.array), site.PCBs = counts.con.subset.sitePCBlabel, gap = unit(0.2, "cm"), 
+                                                                      col = list(site.PCBs = c("> 67th percentile" = "#E78AC3", "33 - 67 percentile" = "#FC8D62", "< 33th percentile" = "#66C2A5", "Non-AOC" = "#A6D854",  "Ref" = "#8DA0CB"))), 
+          bottom_annotation = HeatmapAnnotation(df = heatmap.anno2[,c(1,3:7)], col = list(PCB.coef = col_fun,
+                                                                               `Signal Transduction` = c("down" = "blue", "NA" = "white", "up" = "red"),
+                                                                              `Metabolism of lipids` = c("down" = "blue", "up" = "red"),
+                                                                              `Immune System` = c("down" = "blue", "up" = "red"),
+                                                                              `Cardiac conduction` = c("down" = "blue", "up" = "red"),
+                                                                              `Hemostasis` = c("down" = "blue", "up" = "red")), 
+                                                show_legend = c(TRUE,FALSE, FALSE, FALSE, FALSE, FALSE), annotation_name_gp = gpar(fontsize = 10)))
+
+draw(PCBs_lasso50_heatmap.v4, annotation_legend_list = lgd)
+# saveRDS(PCBs_lasso50_heatmap.v4, "PCBs_logFC_heatmap.rds")
+
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure5a_PCBs_logFC_heatmap.tiff", units="in", width=9, height=10, res=300, compression = 'lzw') ## aspect ratio 1.6
+# ## add legend annotation 
+# draw(PCBs_lasso50_heatmap.v4, annotation_legend_list = lgd)
+# dev.off()
+```
+
+####  PCBs lasso selected genes heatmap deatil functions and pathways
+
+```{r PCBs lasso selected genes heatmap deatil functions and pathways, echo=FALSE, fig.width=9, fig.height=10}
+PCBs_lasso_by_site_50_functional_data <- readRDS("PCBs_lasso_by_site_50_functional_data.rds")
+GOBP_data.matrix <- PCBs_lasso_by_site_50_functional_data$heatmap.bp.plot.data
+Reactome_data.matrix <- PCBs_lasso_by_site_50_functional_data$heatmap.reactome.plot.data
+  
+## figure supplementary
+## combine go and reactome 
+GOBP_data.matrix.t= t(GOBP_data.matrix)
+## remove "all"
+GOBP_data.matrix.t2 = GOBP_data.matrix.t[,-31]
+## correct not equal to 0 = 1 
+GOBP_data.matrix.t2[GOBP_data.matrix.t2 !=0] = 1
+
+
+Reactome_data.matrix.t = t(Reactome_data.matrix[,colnames(GOBP_data.matrix)])
+Reactome_data.matrix.t2 = Reactome_data.matrix.t
+Reactome_data.matrix.t2 = Reactome_data.matrix.t2[,-31]
+Reactome_data.matrix.t2[Reactome_data.matrix.t2 != 0] = 1
+
+## heatmap annotation
+ha = rowAnnotation(PCB.coef = anno_numeric(round(as.numeric(GOBP_data.matrix.t[,"all"]), digits =2), bg_gp = gpar(fill = c("green", "red"))) , annotation_name_rot = 0)
+
+
+row_dend = dendsort(hclust(dist(GOBP_data.matrix.t[,-31])))
+
+## GO terms 
+H1 = Heatmap(GOBP_data.matrix.t2, name = "Total PCBs - \n Lasso regression \n average coef.", column_names_gp = gpar(fontsize = 9), row_names_gp = gpar(fontsize = 11), column_title = "GO:BP", 
+             cluster_rows = row_dend, show_row_dend = FALSE, col = c("white", "black"), rect_gp = gpar(col = "gray", lwd = 1),show_heatmap_legend = FALSE)
+## order by coef
+H1.v2 = Heatmap(GOBP_data.matrix.t2, name = "Total PCBs - \n Lasso regression \n average coef.", column_names_gp = gpar(fontsize = 9), row_names_gp = gpar(fontsize = 11), column_title = "GO:BP", 
+                row_order = order(as.numeric(GOBP_data.matrix.t[,"all"])), col = c("white", "black"), rect_gp = gpar(col = "gray", lwd = 1), show_heatmap_legend = FALSE)
+## Reactome pathways                 
+H2 = Heatmap(Reactome_data.matrix.t2, show_heatmap_legend = FALSE, column_names_gp = gpar(fontsize = 9), row_names_gp = gpar(fontsize = 11), column_title = "Reactome", show_row_dend = FALSE, rect_gp = gpar(col = "gray", lwd = 1), col = c("white", "black"), right_annotation = ha)
+
+# PCBs_BP_Reactome_heatmap = H1 + H2
+PCBs_BP_Reactome_heatmap.v2 = H1.v2 + H2
+# saveRDS(PCBs_BP_Reactome_heatmap.v2, "PCBs_BP_Reactome_heatmap.rds")
+
+## figure5av2
+# draw(H1+H2, padding = unit(c(24, 5, 2, 2), "mm"), ) ## see right heatmap in following
+
+## figure5av3
+draw(H1.v2+H2, padding = unit(c(24, 5, 2, 2), "mm"), ) ## see right heatmap in following
+
+Reactome.PCBs.subset = c("Signal Transduction" , "Metabolism of lipids" , "Immune System" , "Cardiac conduction", "Hemostasis")
+
+```
+
+#### PCB correlation between logFC logCPM and model coef
+
+```{r correlation between logFC logCPM and model coef, message=FALSE, warning=FALSE, fig.width=6, fig.height=6, echo=FALSE}
+## average logFC for lasso selected genes by calculating  individuals with top PCBs tertile based on above col_dend
+PCBs_gene_logFC_abs <- abs(rowSums(counts.con.subset.matrix.corrected[,col_dend$labels[col_dend$order > 130]])/66) ## only choose those birds with > 2/3 logFC relative to star lake 
+PCBs_gene_logCPM <- rowMeans(counts.con.subset.matrix)
+PCBs_gene_lasso_coef <- heatmap.anno$PCB.coef
+names(PCBs_gene_lasso_coef) <- row.names(heatmap.anno)
+PCBs_gene_in_lassmodel.matrix <- data.frame(logFC_abs = PCBs_gene_logFC_abs, log_counts = PCBs_gene_logCPM, PCBs_coef_abs = abs(PCBs_gene_lasso_coef))
+PCBs_gene_in_lassmodel.matrix %>% ggpairs(upper = list(continuous = wrap("cor", method = "pearson")))+theme_bw()
+
+PCB_logFC_correlation_plot <- PCBs_gene_in_lassmodel.matrix %>% ggpairs(upper = list(continuous = wrap("cor", method = "pearson")))+theme_bw()
+# saveRDS(PCB_logFC_correlation_plot,"FigureS4a_PCB_logFC_correlation_plot.rds")
+# 
+# 
+# 
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/FigureS4a_PCBs_counts_logFC_coef_correlation.tiff", units="in", width=5, height=5, res=300, compression = 'lzw') ## aspect ratio 1.6
+# PCBs_gene_in_lassmodel.matrix %>% ggpairs(upper = list(continuous = wrap("cor", method = "pearson")))+theme_bw()
+# dev.off()
+```
+</br>
+
+## 2. Determine lasso regression models to predict PAH concentrations   
+</br>
+
+*Start from first round top genes (110) genes and refine lasso regression analysis for the second round*  
+</br>
+
+### Load data  
+</br>
+
+`GLRI_coldata`  
+: chemistry data ("Dioxin" "MultiRedsiduePest" "PAHs" "PBDEs" "LRPCBs" "HRPCBs" "Pesticides" "PFCs" "PPCPs")  
+
+`data.contaminants.majorSubset.geo.bysite`
+: geometric mean of each contaminant key by site  
+
+`contaminants.coldata.subset`
+: only includes the nestlings with genomic information and removes PAHs data  
+
+`ID.convert`
+: gene ID convertion table between tree swallow gene pseudo name and chicken gene name  
+
+`siteMAP.all`
+: site ID and propersite name convertion Table  
+
+`dds.bothSex.adjusted or counts.tswallow`
+: normalized count matrix for all nestlings, adjusted for batch difference  
+
+`Cont.major.list`
+: major contaminants ("Nonachlor, cis-_C", "Heptachlor Epoxide_C",   "Nonachlor, trans-_C",  "PFDA_C", "Chlordane, oxy-_C", "Total Parent PAHs", "Total PBDE", "Total PAHs","Total PCBs","Total_PFCs")
+
+`counts.tswallow.norm`
+: vst transformed normalized counts   
+
+`topgene.list`
+: 110 top genes determined from the first round of lasso regression analysis. Detail can be found [here](GLRI_MS2_FirstRound_lasso.nb.html)  
+
+
+```{r Load PAHs data, include=FALSE}
+## 2nd round regression with PAHs by site
+## lasso regression by site average geoMean / contaminants 
+## Determine top1000 genes from each contaminants
+# load data 
+GLRI_coldata <- readRDS("GLRI_coldata_to2020.rds")
+# Determine min contamin value for each Key
+GLRI_coldata <- GLRI_coldata$contaminants %>% filter(!is.na(Value))
+# Load GeoMean
+data.contaminants.majorSubset.geo.bysite <- readRDS("data_contaminants_majorSubset_geo_bysite.rds")
+data.contaminants.majorSubset.geo.bysite$MergeSite[data.contaminants.majorSubset.geo.bysite$MergeSite == "ref"] <- "SL"
+## combine all duplicated items by MergeSite
+data.contaminants.majorSubset.geo.bysite <- data.contaminants.majorSubset.geo.bysite %>% group_by(proper_site2,MergeSite,Key) %>% summarise(value.geoMean2 = mean(value.geoMean)) %>% ungroup()
+colnames(data.contaminants.majorSubset.geo.bysite)[colnames(data.contaminants.majorSubset.geo.bysite) == "value.geoMean2"] <- "value.geoMean" ## change the name back
+# Load Genomic ID convert table 
+ID.convert <- readRDS("IDmap_final.rds") ## gene ID Convert table
+# Load site coldata map
+siteMAP.all <- as_tibble(readRDS("siteMAP_all.rds")) ## site ID convert Table
+siteMAP.all$SiteID[siteMAP.all$propersite == "StarLake"] <- "SL"
+# Load gene expression data
+dds.bothSex.adjusted <- readRDS("dds.bothSex.adjusted.outlierRM.rds") ## normalized count matrix
+dds.bothSex.adjusted$propersite2 <- as.character(siteMAP.all$propersite[match(dds.bothSex.adjusted$site, siteMAP.all$SiteID)])# add propersite2 as site full name 
+counts.tswallow <- assay(dds.bothSex.adjusted) # count matrix
+# major contaminant for comparison
+# Cont.major.list <- c("Nonachlor, cis-_C", "Heptachlor Epoxide_C",   "Nonachlor, trans-_C",  "PFDA_C", "Chlordane, oxy-_C", "Total Parent PAHs", "Total PBDE", "Total PAHs","Total PCBs","Total_PFCs")
+counts.tswallow.norm <- vst(dds.bothSex.adjusted)
+counts.tswallow.norm <- assay(counts.tswallow.norm)
+topgene.list = readRDS("lasso_topgene_bySite_PAHs.rds") ## top 110 genes 
+
+```
+
+### Load self-determined functions 
+</br>
+
+
+- `lasso.by.site.top100(Con,Con_ind,i,Min_L,s)` : Lasso leave one (site) out cross-validaiton model training, Min_L for the lowest the lamda cv goes 10^(-2,-3,-4); s: lamda.sequence: 1) 1se 2) min 3) log median  
+
+- `Run_lasso_by_site.top100(n,Con,Con_ind,N_train,Min_L,s)` : Run `lasso.by.site.top100` with n runs throughout all 28 sites = 28n   
+
+- `evaluation_funciton.bysite.PAH` : generate performance metrics 
+
+
+```{r Load self-determined functions, warning=FALSE, message=FALSE}
+
+# N: N repeat leave one (site) out validation;  Min_L for the lowest the lamda cv goes 10^(-2,-3,-4); s: lamda.sequence: 1) 1se 2) min 3) log median 
+lasso.by.site.top100 <- function(Con,Con_ind,i,Min_L,s) {
+  BySiteResult.withlamdaP <- {} ## refresh
+  variables.all <- list()
+  predict.site.test.all <- list()
+  match1 <- str_sub(colnames(counts.tswallow.norm),3,4) %in% contaminants.coldata.subset2$MergeSite
+  counts.con  <-  counts.tswallow.norm[,match1]
+  counts.con.batch <- as.factor(as.character(dds.bothSex.adjusted$batch2)[match1])
+  counts.con.sex <- as.factor(as.character(dds.bothSex.adjusted$sex)[match1])
+  counts.con.contamin <- log10(contaminants.coldata.subset2$value.geoMean[match(str_sub(colnames(counts.con),3,4), contaminants.coldata.subset2$MergeSite)])
+  ## Building matrix 
+  if (length(levels(counts.con.batch)) > 1) {
+    counts.con.t <- as.data.frame(t(counts.con[topgene.list,]))
+    counts.con.t <- cbind(counts.con.t, batch = counts.con.batch, sex = counts.con.sex, contaminant = counts.con.contamin)
+    m <- model.matrix(contaminant ~ batch +., counts.con.t)
+    m <- m[,-1] } else {
+      counts.con.t <- as.data.frame(t(counts.con[topgene.list,]))
+      counts.con.t <- cbind(counts.con.t, sex = counts.con.sex, contaminant = counts.con.contamin)
+      m <- model.matrix(contaminant ~ ., counts.con.t)
+      m <- m[,-1] }  
+  
+  site.all <- str_sub(colnames(counts.con),3,4)
+  # print(length(unique(site.all)))
+  site <- unique(str_sub(colnames(counts.con),3,4))
+  site.test <- site[i]
+  match1.test <- site.all == site.test
+  training = sample(which(!match1.test), size =  round(sum(!match1.test)*0.9))
+  l.1se.all = {}
+  l.min.all = {}
+  l.median.all = {}
+  for (j in 1:20) {
+  l.1se <- {} ## repeat 10 times to avoid outlier in cross validation 
+  l.min <- {}
+  cvfit <- cv.glmnet(x=m[training,], y=counts.con.t$contaminant[training], nfolds = 10, alpha = 1, lambda = 10^seq(0,Min_L,length=600))
+  l.1se <- cvfit$lambda.1se
+  l.min <- cvfit$lambda.min
+  l.median <- exp(mean(c(log(l.1se),log(l.min))))
+  l.1se.all <- c(l.1se.all,l.1se)
+  l.min.all <- c(l.min.all,l.min)
+  l.median.all <- c(l.median.all,l.median)
+  }
+  l.1se = median(l.1se.all)
+  l.min = median(l.min.all)
+  l.median = median(l.median.all)
+  lamda.sequence <- c(l.1se,l.min,l.median)  
+  names(lamda.sequence) <- c("1se","min","median")
+  fit <- glmnet(x=m[training,], y=counts.con.t$contaminant[training], alpha = 1, lambda = 10^seq(0,Min_L,length=600))
+  error.result <- assess.glmnet(fit, newx = m[match1.test,], newy = counts.con.t$contaminant[match1.test], s = lamda.sequence[s])
+  error.term <- c(error.result$mse, error.result$mae)
+  names(error.term) <- c("mse","mae")
+  variables <- coef(fit, s = lamda.sequence[s], gamma = 1)  
+  variables <- variables[,1][!(variables[,1] == 0)]
+  variables <- variables[-1]
+  pseudo_R2 <- fit$dev.ratio[which(sort(c(lamda.sequence[s],10^seq(0,Min_L,length=600)),decreasing = TRUE) == lamda.sequence[s])[1] -1]
+  predict.site <- predict(fit, newx = m[match1.test,], s = lamda.sequence[s])
+  result = list(lamda.sequence,error.term,variables,pseudo_R2,predict.site)
+  names(result) <- c("lamda.sequence","mse_mae","variables","pseudo_R2","predict.site")
+  return(result)
+}
+Run_lasso_by_site.top100 <- function(n,Con,Con_ind,N_train,Min_L,s) {
+  TIME1 <- Sys.time()
+  lassositeResult.run <- foreach(i = rep(1:28,each= n) , .packages = c("stringr", "dplyr","glmnet"), .export = c("lasso.by.site.top100", "contaminants.coldata.subset2","topgene.list","counts.tswallow.norm","dds.bothSex.adjusted", "data.contaminants.majorSubset.geo.bysite")) %dopar% {
+    lasso_result <- Vectorize(lasso.by.site.top100)(Con,Con_ind,i,Min_L,s)
+    return(lasso_result)
+  }
+  TIME2 <- Sys.time()
+  print(TIME2 - TIME1)
+  return(lassositeResult.run)
+  
+}
+evaluation_funciton.bysite.PAH <- function(Result) {
+  result.all <- {}
+  evaluation.result <- {}
+  predictions = Result
+  ## geoMean: only use overlapped genomic site individulas training samples to calculate geoMean
+  predictions2 = data.frame(site = names(Result), predictions, geoMean = log10(contaminants.coldata.subset2$value.geoMean[match(names(Result),contaminants.coldata.subset2$MergeSite)]), b33 =  log10(quantile(contaminants.coldata.subset2$value.geoMean, probs = 0.33, na.rm = FALSE, names = FALSE)), t33 = log10(quantile(contaminants.coldata.subset2$value.geoMean, probs = 0.67, na.rm = FALSE, names = FALSE)))
+  predictions3 = cbind(predictions2, is.top33 = predictions2$geoMean >= predictions2$t33, is.bottom33 = predictions2$geoMean <= predictions2$b33, is.top.predict = predictions2$predictions >= predictions2$t33, is.bottom.predict = predictions2$predictions <= predictions2$b33)
+  predictions.all = predictions3
+  predictions.all$delta = (predictions.all$predictions - predictions.all$geoMean)^2
+  MSE = sum(predictions.all$delta)/nrow(predictions.all)
+  
+  error.top =  sum(predictions.all$is.top.predict & predictions.all$is.bottom33)/ sum(predictions.all$is.top.predict)
+  
+  error.bottom = sum(predictions.all$is.bottom.predict & predictions.all$is.top33)/ sum(predictions.all$is.bottom.predict) # 0 / 0 
+  
+  eorror.both = sum((predictions.all$is.top.predict & predictions.all$is.bottom33) | (predictions.all$is.bottom.predict & predictions.all$is.top33))/ sum(predictions.all$is.top.predict | predictions.all$is.bottom.predict)
+  
+  accuracy.top =  sum(predictions.all$is.top.predict & predictions.all$is.top33)/ sum(predictions.all$is.top.predict) 
+  
+  accuracy.bottom = sum(predictions.all$is.bottom.predict & predictions.all$is.bottom33)/ sum(predictions.all$is.bottom.predict) 
+  
+  accuracy.both = sum((predictions.all$is.top.predict & predictions.all$is.top33)  | (predictions.all$is.bottom.predict & predictions.all$is.bottom33))/ sum(predictions.all$is.bottom.predict | predictions.all$is.top.predict) 
+  
+  testing_ratio = c(top_ratio = sum(predictions.all$is.top33)/nrow(predictions.all), bottom_ratio = sum(predictions.all$is.bottom33)/nrow(predictions.all))
+  
+  performance.result = c(error.top = error.top,error.bottom = error.bottom, error.both = eorror.both, accuracy.top = accuracy.top ,accuracy.bottom = accuracy.bottom,accuracy.both = accuracy.both, testing_ratio, MSE = MSE)
+  evaluation.result = list(predictions.by.site=predictions.all, performance.result = performance.result)
+  return(evaluation.result)
+}
+
+```
+</br>
+
+### Builid lasso regression model to predict pool stomach PAH concentrations by site
+*Run `Run_lasso_by_site.top100` with 40 re-sampling, 1120 leave one out cross validation; lamda 1se
+then evaluate the model performance using `evaluation_funciton.bysite.PAH`*
+
+```{r Data input for Run lasso for PAHs prediction, warning=FALSE, message=FALSE}
+Con="PAHs_data";Con_ind="Total PAHs"
+### edit subset for overlappign genomic samples with contaminant data 
+contaminants.coldata.subset2 <-data.contaminants.majorSubset.geo.bysite
+### Individual chemicals 
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% filter(Key == Con_ind)
+## combine all duplicated items using mean value becasue they have the same MergeSite ## only RiverRaisin will be affected 
+contaminants.coldata.subset2 <- contaminants.coldata.subset2 %>% group_by(MergeSite, Key) %>% summarise(value.geoMean2 = mean(value.geoMean)) %>% ungroup()
+colnames(contaminants.coldata.subset2)[colnames(contaminants.coldata.subset2) == "value.geoMean2"] <- "value.geoMean" ## change the name back
+# print(sum(duplicated(contaminants.coldata.subset2$MergeSite))) ## check duplication again
+```
+
+
+```{r Run lasso for PAHs prediction, eval=FALSE}
+cl <- parallel::makeCluster(12)
+doParallel::registerDoParallel(cl)
+PAHs_CV_bySite_result = Run_lasso_by_site.top100(n=40,Con=Con,Con_ind = Con_ind, Min_L = -2, s = 1)
+parallel::stopCluster(cl)
+# saveRDS(PAHs_CV_bySite_result, "PAHs_CV_bySite_result.rds")
+```
+
+
+```{r Run lasso for PAHs prediction and result processing, warning=FALSE, message=FALSE}
+PAHs_CV_bySite_result <- readRDS("PAHs_CV_bySite_result.rds")
+Result = sapply(1:1120, function(x) mean(PAHs_CV_bySite_result[[x]][5][[1]]))
+names(Result) = sapply(1:1120, function(x) str_sub(row.names(PAHs_CV_bySite_result[[x]][5][[1]])[1],3,4))
+PAHs.performance.bysite.report = evaluation_funciton.bysite.PAH(Result = Result) 
+# print(PAHs.performance.bysite.report$performance.result)
+ # error.top    error.bottom      error.both    accuracy.top accuracy.bottom   accuracy.both       top_ratio    bottom_ratio             MSE 
+ #     0.07827476      0.00000000      0.07790143      0.74281150      1.00000000      0.74403816      0.42857143      0.17857143      0.13560998 
+
+# Edit variables
+variables.length.summary <-  summary(sapply(1:length(PAHs_CV_bySite_result), function(x) length(PAHs_CV_bySite_result[[x]][3][[1]])))
+# Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#   37.00   54.00   57.00   56.59   60.00   70.00 
+variables.length.p95 <- quantile(sapply(1:length(PAHs_CV_bySite_result), function(x) length(PAHs_CV_bySite_result[[x]][3][[1]])),0.95)
+variables <- names(sort(table(unlist(sapply(1:length(PAHs_CV_bySite_result), function(x) names(PAHs_CV_bySite_result[[x]][3][[1]])))),decreasing = TRUE)[1:variables.length.p95])
+variables <- list(variables)
+variables$name <- ID.convert$GeneName[match(variables[[1]],ID.convert$GeneID2)] 
+variables.coef = unlist(lapply(1:length(PAHs_CV_bySite_result), function(x) na.omit(PAHs_CV_bySite_result[[x]][3][[1]][variables[[1]]])))
+# geomean_func = function(x) {exp(mean(log(x)))}
+variables.coef.aggregate = aggregate(variables.coef, list(Gene = names(variables.coef)),mean)
+colnames(variables.coef.aggregate)[2] = "coef"
+variables.coef.aggregate = data.frame(name = ID.convert$GeneName[match(variables.coef.aggregate$Gene, ID.convert$GeneID2)], variables.coef.aggregate)
+# remove duplicates TFCP2L1 and CSMD1 
+variables.coef.aggregate <- variables.coef.aggregate[c(-8,-10),] 
+
+# dev.ratio
+dev.ratio.n <- length(PAHs_CV_bySite_result)
+dev.ratio <- sapply(1:dev.ratio.n, function(x) PAHs_CV_bySite_result[[x]][[4]])
+dev.ratio.mean <- mean(dev.ratio)
+dev.ratio.s <- sd(dev.ratio)
+margin <- qt(0.975,df=dev.ratio.n-1)*dev.ratio.s/sqrt(dev.ratio.n)
+dev.ratio.PAHs = c(mean = dev.ratio.mean, margin = margin)
+# print(dev.ratio.PAHs)
+# mean      margin 
+# 0.734270005 0.001355791 
+
+# Construct panther GO analysis 
+library(xml2)
+PAHs_bp.data.raw <- read_xml("PAHs_2ndLasso_funcionts.xml") ## from  PANTHER17.0 http://www.pantherdb.org/
+id = xml_text(xml_find_all(PAHs_bp.data.raw, "//result/term/id"))
+term = xml_text(xml_find_all(PAHs_bp.data.raw, "//result/term/label"))[-319] # remove no class item
+number_in_list = as.numeric(xml_text(xml_find_all(PAHs_bp.data.raw, "//result/input_list/number_in_list")))[-319]
+number_in_reference = as.numeric(xml_text(xml_find_all(PAHs_bp.data.raw, "//result/number_in_reference")))[-319]
+pValue = as.numeric(xml_text(xml_find_all(PAHs_bp.data.raw, "//pValue")))[-319]
+fold_enrichment = as.numeric(xml_text(xml_find_all(PAHs_bp.data.raw, "//fold_enrichment")))[-319]
+mapped_id = sapply(1:319, function(x) xml_text(xml_children(xml_find_all(PAHs_bp.data.raw, "//result/input_list/mapped_id_list")[x])))[-319]
+names(mapped_id) <- id
+PAHs_bp.panther = tibble(id = id, term = term, number_in_list = number_in_list, number_in_reference = number_in_reference, pValue = pValue, fold_enrichment = fold_enrichment, mapped_id = mapped_id)
+PAHs_bp.panther.mapped_id = PAHs_bp.panther$mapped_id
+## check lasso selected PAHs related genes funcions and plot as heatmap 
+PAHs_bp.panther.trim = PAHs_bp.panther %>% filter(number_in_reference < 5000 & number_in_reference > 200)  # select more general go terms 
+PAHs_bp.panther.mapped_id$all = unique(na.omit(variables.coef.aggregate$name))
+PAHs_bp.panther.data = data.frame(GOBP_ID = rep(names(PAHs_bp.panther.mapped_id), sapply(1:319, function(x) length(PAHs_bp.panther.mapped_id[[x]])) ), name = unlist(PAHs_bp.panther.mapped_id, use.names = FALSE))
+PAHs_bp.panther.data = dplyr::left_join(PAHs_bp.panther.data, variables.coef.aggregate)
+PAHs_bp.panther2 = PAHs_bp.panther
+colnames(PAHs_bp.panther2)[1] = "GOBP_ID"
+PAHs_bp.panther.data = dplyr::left_join(PAHs_bp.panther.data, PAHs_bp.panther2[,1:6])
+
+## Using Revigo to remove redundnat GO terms : PLoS ONE 2011. doi:10.1371/journal.pone.0021800 
+# The Gene Ontology database (go.obo) which is dated Thursday, November 3, 2022.
+# The UniProt-to-GO mapping database from the EBI GOA project (goa_uniprot_gcrp.gaf.gz) which is dated Friday, September 16, 2022.
+Revigo.selected.gobp <- c(
+  "all",
+  "GO:0009987",
+  "GO:0007010",
+  "GO:0007154",
+  "GO:0023052",
+  "GO:0030029",
+  "GO:0033554",
+  "GO:0051716",
+  "GO:0042592",
+  "GO:0048523",
+  "GO:0048878",
+  "GO:0050896",
+  "GO:0072359"
+  )
+PAHs_bp.panther.data$term[PAHs_bp.panther.data$GOBP_ID == "all"] = "all"
+data <- as_tibble(PAHs_bp.panther.data[,c(1,2,4,5)])
+data <- data %>% filter(GOBP_ID %in% Revigo.selected.gobp)
+data <- data %>% spread(key = "name" , value = "coef")
+data.matrix = data[,3:59]
+
+data.matrix = as.matrix(data.matrix)
+row.names(data.matrix) = data$term
+data.matrix[is.na(data.matrix)] = 0
+
+PAHs_lasso_by_site_50_functional_data = list(panther_result = PAHs_bp.panther, gene_mapped_panther_result = PAHs_bp.panther.data, heatmap_plot_data = data.matrix, top_go_terms = Revigo.selected.gobp)
+# saveRDS(PAHs_lasso_by_site_50_functional_data,  "PAHs_lasso_by_site_50_functional_data.rds")
+PAHs.performance.report <- list(PAHs.performance.bysite.report = PAHs.performance.bysite.report, PAHs.variables = list(variables,variables.coef.aggregate, PAHs_bp.panther.data), PAHs.dev.ratio = dev.ratio.PAHs)
+# saveRDS(PAHs.performance.report, "PAHs.performance.reportaggregate.rds")
+
+performance.metrics <- round(data.frame(PAHs.performance.report$PAHs.performance.bysite.report$performance.result),3)
+colnames(performance.metrics) <- c("Pooled PAHs concentrations by site")
+# saveRDS(performance.metrics, "PAHs.performance.metrics.rds")
+
+```
+
+### PAHs lasso prediction results {.tabset}
+
+#### Predicted vs actural yy plot by site 
+```{r PAHs yy plot, echo=FALSE}
+## PAHs lasso plot 
+PAHs.performance.report <- readRDS("PAHs.performance.reportaggregate.rds")
+
+## figure for plotting PAH yy prediciton vs measured plot 
+
+library(gghighlight)
+library(ggpubr)
+## PAHs lasso plot 
+
+PAHs.performance.report$PAHs.performance.bysite.report$predictions.by.site <- PAHs.performance.report$PAHs.performance.bysite.report$predictions.by.site %>% mutate(predicted.percentile = "middle")
+PAHs.performance.report$PAHs.performance.bysite.report$predictions.by.site$predicted.percentile[PAHs.performance.report$PAHs.performance.bysite.report$predictions.by.site$is.top.predict] <- "top"
+PAHs.performance.report$PAHs.performance.bysite.report$predictions.by.site$predicted.percentile[PAHs.performance.report$PAHs.performance.bysite.report$predictions.by.site$is.bottom.predict] <- "bottom"
+
+
+theme_set(theme_classic())
+p <- ggplot(data=PAHs.performance.report$PAHs.performance.bysite.report$predictions.by.site, aes(x=predictions, y=geoMean)) + xlab("predicted log10 Total PAHs (ng/g wet wt.)") + ylab("log10 Total PAHs (ng/g wet wt.)")
+
+
+PAHs.predictions.yyplot.v2 <-
+  p + 
+  geom_point(aes(col =  predicted.percentile)) +
+  scale_color_manual(name="Predicted [PAHs]", 
+                     labels = c("above 67th", "middle", "below 33rd"), 
+                     values = c("top"="red", "middle" = "lightgray", "bottom"="blue"))+
+                      geom_hline(yintercept=1.805, linetype="dotted", color = "blue") +
+  geom_hline(yintercept=2.190, linetype="dotted", color = "red")+
+  geom_vline(xintercept=2.190, linetype="dotdash", color = "red")+
+  geom_vline(xintercept=1.805, linetype="dotdash", color = "blue")+
+  geom_text(aes(2.61, 1.805, label = "33rd percentile", vjust = - 1), color = "blue") +
+  geom_text(aes(2.61, 2.190, label = "67th percentile", vjust = - 1), color = "red") +
+  stat_cor(method = "spearman", label.x = 1.75, label.y = 3.5, cor.coef.name = "rho")+
+  stat_cor(method = "pearson", label.x = 1.75, label.y = 3.4, cor.coef.name = "R")+
+  theme_bw(base_size = 12)
+
+PAHs.predictions.yyplot.v2
+```
+
+#### Predicted vs actural yy plot by site with CI  
+```{r Predicted vs actural yy plot by site with CI, echo=FALSE}
+## PAHs lasso plot 
+PAHs.performance.report <- readRDS("PAHs.performance.reportaggregate.rds")
+
+## figure for plotting PAH yy prediciton vs measured plot 
+
+library(gghighlight)
+library(ggpubr)
+## PAHs lasso plot 
+plot.data.PAHs <- as_tibble(PAHs.performance.bysite.report$predictions.by.site[,c(1,2,3)])
+plot.data.PAHs <- plot.data.PAHs %>% group_by(site) %>% summarise(predictions = mean(predictions), measured = mean(geoMean)) %>% ungroup()
+plot.data.PAHs <- plot.data.PAHs %>% mutate(proper_site2 = siteMAP.all$propersite[match(plot.data.PAHs$site, siteMAP.all$SiteID)])
+
+fit.PAHs <- lm(measured ~ predictions, data = plot.data.PAHs)
+dat <- predict(fit.PAHs, interval="confidence", level = 0.999)
+plot.data.PAHs$inside <- ifelse(plot.data.PAHs$measured < dat[,"upr"] & plot.data.PAHs$measured > dat[,"lwr"], "in", "out")
+
+
+# 
+# # Scatterplot
+PAHs.yyplot.bysite2.1 <- ggplot(plot.data.PAHs, aes(x=predictions, y=measured)) +
+  geom_point(aes(col = inside),  show.legend = FALSE) +
+  scale_color_manual(name="",
+                     labels = c("out", "in"),
+                     values = c("out"="red", "in"="gray")) +
+  labs(y="log10 Total PAHs (ng/g wet wt.)",
+       x="Predicted log10 Total PAHs (ng/g wet wt.)",
+       title="")+
+  # geom_text_repel(data = plot_data2[!plot_data2$str == "C",], aes(label = proper_site2, x=predictions, y=geometric.mean)) +
+  geom_smooth(method=lm, color='gray', fill='lightblue', level=0.999, formula = "y ~ x") +
+  # geom_smooth(method="loess", color='gray', fill='lightblue', level=0.95, formula = "y ~ x") +
+  theme_classic(base_size = 11)
+
+PAHs.yyplot.bysite2.2 <- ggplot(plot.data.PAHs, aes(x=predictions, y=measured)) +
+  geom_point(aes(col = inside),  show.legend = FALSE) +
+  scale_color_manual(name="",
+                     labels = c("out", "in"),
+                     values = c("out"="red", "in"="gray")) +
+  labs(y="log10 Total PAHs (ng/g wet wt.)",
+       x="Predicted log10 Total PAHs (ng/g wet wt.)",
+       title="")+
+  geom_text_repel(data = plot.data.PAHs, aes(label = proper_site2, x=predictions, y=measured)) +
+  geom_smooth(method=lm, color='gray', fill='lightblue', level=0.999, formula = "y ~ x") +
+  theme_classic(base_size = 11)
+
+
+# # 
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure_pending_PAHss_discusscomplexmixture.tiff", units="in", pointsize = 10, width=6, height=6, res=300, compression = 'lzw')
+# PAHs.yyplot.bysite2.1
+# dev.off()
+# 
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure_pending_PAHssV2_discusscomplexmixture.tiff", units="in", pointsize = 10, width=6, height=6, res=300, compression = 'lzw')
+# PAHs.yyplot.bysite2.2
+# dev.off()
+# 
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure_pending_PAHssV2_discusscomplexmixture.tiff", units="in", pointsize = 10, width=6, height=6, res=300, compression = 'lzw')
+# PAHs.yyplot.bysite2.2
+# dev.off()
+# 
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure_pending_discusscomplexmixtureV1.tiff", units="in", pointsize = 12, width=5, height=10, res=300, compression = 'lzw')
+# ggarrange(yyplot.bysite2.1, PAHs.yyplot.bysite2.1,
+#           labels = c("a", "b"),
+#           ncol = 1, nrow = 2)
+# dev.off()
+# 
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure_pending_discusscomplexmixtureV2.tiff", units="in", pointsize = 12, width=6, height=12, res=300, compression = 'lzw')
+# ggarrange(yyplot.bysite2.2, PAHs.yyplot.bysite2.2,
+#           labels = c("a", "b"),
+#           ncol = 1, nrow = 2)
+# dev.off()
+
+
+PAHs.yyplot.bysite2.1
+```
+
+#### model performance
+```{r PAHs show performance table, echo=FALSE}
+performance.metrics <- readRDS("PAHs.performance.metrics.rds")
+knitr::kable(performance.metrics, caption = "PAHs lasso regression model performance metrics")
+```
+
+
+#### Predictor genes selected in the model   
+
+```{r PAHs dev.ratio, echo=FALSE}
+PAHs.top.predictors <- as_tibble(PAHs.performance.report$PAHs.variables[[2]][!is.na(PAHs.performance.report$PAHs.variables[[2]]$name) ,c(1,3,2)])
+knitr::kable(PAHs.top.predictors, "simple", caption = "PAHs top predictor genes and coefficient", align = "lcc")
+```
+### PAHs top gene predictors functions and pathways {.tabset}
+
+
+#### PAHs lasso selected genes heatmap
+
+```{r Figure 5b PAHs lasso selected genes heatmap, echo=FALSE, message=FALSE, warning=FALSE, fig.width=11, fig.height=9}
+
+## figure plotting site average count heatmap against PAHs concentration 
+PAHs_GOBP_subset = c("cellular process","response to stimulus","negative regulation of cellular process","homeostatic process","cellular response to stress","cytoskeleton organization")
+
+# contaminants.coldata.subset2
+match1 <- str_sub(colnames(counts.tswallow.norm),3,4) %in% contaminants.coldata.subset2$MergeSite
+counts.con  <-  counts.tswallow.norm[,match1]
+counts.con.mean.subset <- t(counts.con[variables.coef.aggregate$Gene[!is.na(variables.coef.aggregate$name)],])
+counts.con.mean.subset <- as_tibble(cbind(id = str_sub(row.names(counts.con.mean.subset),3,4), counts.con.mean.subset))
+counts.con.mean.subset <- counts.con.mean.subset %>% gather(key = "gene", value = "normalized.counts", -id) 
+counts.con.mean.subset$normalized.counts <- as.numeric(counts.con.mean.subset$normalized.counts)
+counts.con.mean.subset <- counts.con.mean.subset %>% group_by(id,gene) %>% summarise(counts.mean = mean(normalized.counts)) %>% ungroup()
+counts.con.mean.subset <- counts.con.mean.subset %>% spread(key=gene, value = counts.mean)
+counts.con.mean.subset.matrix = as.matrix(counts.con.mean.subset[,2:55])
+colnames(counts.con.mean.subset.matrix) =  variables.coef.aggregate$name[match(colnames(counts.con.mean.subset)[2:55], variables.coef.aggregate$Gene)]
+counts.con.mean.subset.matrix <- counts.con.mean.subset.matrix[,!duplicated(colnames(counts.con.mean.subset.matrix))] # remove duplicate 
+row.names(counts.con.mean.subset.matrix) <- siteMAP.all$propersite[match(counts.con.mean.subset$id, siteMAP.all$SiteID)]
+
+## corrected PAHs count matrix subset for heatmap divide by StarLake expression level
+counts.con.mean.subset.matrix.SLcorrect <- t(t(counts.con.mean.subset.matrix) - t(counts.con.mean.subset.matrix)[,"StarLake"])[-20,]
+counts.con.contamin <- log10(contaminants.coldata.subset2$value.geoMean[match(counts.con.mean.subset$id, contaminants.coldata.subset2$MergeSite)])
+names(counts.con.contamin) = siteMAP.all$propersite[match(counts.con.mean.subset$id, siteMAP.all$SiteID)]
+## add percentile label for annotaion 
+counts.con.contamin.label <- counts.con.contamin
+counts.con.contamin.label[counts.con.contamin > 2.190] <-  "> 67th percentile"
+counts.con.contamin.label[counts.con.contamin < 1.805] <- "< 33th percentile"
+counts.con.contamin.label[counts.con.contamin < 2.190 & counts.con.contamin > 1.805] <- "33 - 67 percentile"
+counts.con.contamin.label[names(counts.con.contamin.label) %in% c("GreenMnt","IndianRidge","WildRiceLake","MaryJane","Oscoda")] <- "Non-AOC"
+counts.con.contamin.label <- factor(counts.con.contamin.label, levels = c("> 67th percentile","33 - 67 percentile","< 33th percentile", "Non-AOC"))
+## edit data.matrix for PAHs_GOBP_subset
+PAHs_GOBP_subset.matrix <- data.matrix[PAHs_GOBP_subset,]
+PAHs_GOBP_subset.matrix.temp <- PAHs_GOBP_subset.matrix
+PAHs_GOBP_subset.matrix[PAHs_GOBP_subset.matrix.temp > 0] <- "up"
+PAHs_GOBP_subset.matrix[PAHs_GOBP_subset.matrix.temp < 0] <- "down"
+PAHs_GOBP_subset.matrix[PAHs_GOBP_subset.matrix.temp == 0] <- NA
+PAHs_GOBP_subset.matrix <- t(PAHs_GOBP_subset.matrix)
+PAHs_GOBP_subset.matrix <- PAHs_GOBP_subset.matrix[colnames(counts.con.mean.subset.matrix.SLcorrect),]
+
+PAHs.heatmap.anno <- data.frame(gene_name = colnames(counts.con.mean.subset.matrix.SLcorrect), PAHs.coef = variables.coef.aggregate$coef[match(colnames(counts.con.mean.subset.matrix.SLcorrect), variables.coef.aggregate$name)], 
+                                expression = colMeans(counts.con.mean.subset.matrix), PAHs_GOBP_subset.matrix)
+colnames(PAHs.heatmap.anno)[4:ncol(PAHs.heatmap.anno)] <- colnames(PAHs_GOBP_subset.matrix) # correct column name to "space" gapped 
+
+library(dendsort)
+library(circlize)
+col_fun = colorRamp2(c(-0.2, 0, 0.2), c("blue", "white", "red"))
+
+# row_dend = dendsort(hclust(dist(counts.con.mean.subset.matrix.SLcorrect, method = "euclidian"), method = "complete"), isReverse = TRUE)
+col_dend = dendsort(hclust(dist(t(counts.con.mean.subset.matrix.SLcorrect), method = "euclidian"),method = "ward.D2"))
+rows.cor <- dendsort(hclust(as.dist(1- cor(t(counts.con.mean.subset.matrix.SLcorrect), use = "pairwise.complete.obs", method = "pearson")), method = "complete"), isReverse = TRUE) ## using pearson correlation to see if sites have similar change of gene expression 
+
+
+## figure PAHs_lasso50_heatmap.v3
+PAHs_lasso50_heatmap.v1 <-
+  Heatmap(counts.con.mean.subset.matrix.SLcorrect, name = "logFC", cluster_columns = col_dend, cluster_rows = rows.cor, show_row_names = TRUE, column_names_gp = gpar(fontsize = 8),
+          column_title = "", left_annotation = rowAnnotation(`[PAHs]` = anno_points(counts.con.contamin[row.names(counts.con.mean.subset.matrix.SLcorrect)]), site.PAHs = counts.con.contamin.label[row.names(counts.con.mean.subset.matrix.SLcorrect)], gap = unit(0.2, "cm"), 
+          col = list(site.PAHs = c("> 67th percentile" = "#E78AC3", "33 - 67 percentile" = "#FC8D62", "< 33th percentile" = "#66C2A5", "Non-AOC" = "#A6D854",  "Ref" = "#8DA0CB"))), 
+          bottom_annotation = HeatmapAnnotation(df = PAHs.heatmap.anno[,c(-1,-3)], col = list(PAHs.coef = col_fun, 
+                                                                              # expression = colorRamp2(c(4, 12.7), c("white", "red")),
+                                                                              `cellular process` = c("down" = "blue", "up" = "red"),
+                                                                              `response to stimulus` = c("down" = "blue", "up" = "red"),
+                                                                              `negative regulation of cellular process` = c("down" = "blue", "up" = "red"),
+                                                                              `homeostatic process` = c("down" = "blue", "up" = "red"),
+                                                                              `cellular response to stress` = c("down" = "blue", "up" = "red"),
+                                                                              `cytoskeleton organization` = c("down" = "blue", "up" = "red")), 
+                                                        show_legend = c(TRUE,  FALSE, FALSE, FALSE, FALSE, FALSE, FALSE), annotation_name_gp = gpar(fontsize = 10)))
+lgd_Bp_terms = Legend(title = "GO:BP terms", legend_gp  = gpar(fill = c("red","blue")), 
+                      labels = c("up", "down"))
+draw(PAHs_lasso50_heatmap.v1, annotation_legend_list = lgd_Bp_terms, adjust_annotation_extension = FALSE)
+
+# 
+# 
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/Figure5b_PAHs_logFC_heatmap.tiff", units="in", width=9, height=9, res=300, compression = 'lzw') ## aspect ratio 1.6
+# ## add legend annotation
+# draw(PAHs_lasso50_heatmap.v1, annotation_legend_list = lgd_Bp_terms, heatmap_legend_side = "bottom", annotation_legend_side = "bottom", merge_legend = TRUE)
+# dev.off()
+
+```
+
+#### PAH correlation between logFC, logCPM, and model coef
+
+```{r PAH correlation between logFC, logCPM, and model coef, echo=FALSE}
+## average logFC for lasso selected genes by calculating  sites with top PAHs tertile based on above col_dend
+PAHs_gene_logFC_abs <- abs(colSums(counts.con.mean.subset.matrix.SLcorrect[rows.cor$labels[rows.cor$order > 18],])/9) ## pick top 1/3 logFC sites 
+PAHs_gene_logCPM <- colMeans(counts.con.mean.subset.matrix)
+PAHs_gene_lasso_coef <- PAHs.performance.report$PAHs.variables[[2]]$coef[match(names(PAHs_gene_logFC_abs),PAHs.performance.report$PAHs.variables[[2]]$name)]
+names(PAHs_gene_lasso_coef) <- names(PAHs_gene_logFC_abs)
+PAHs_gene_in_lassmodel.matrix <- data.frame(logFC_abs = PAHs_gene_logFC_abs, log_counts = PAHs_gene_logCPM, PAHs_coef_abs = abs(PAHs_gene_lasso_coef))
+library("ggplot2")
+library("GGally")
+
+PAHs_logFC_correlation_plot <-
+PAHs_gene_in_lassmodel.matrix %>% ggpairs(upper = list(continuous = wrap("cor", method = "pearson")))+theme_bw()
+
+
+PAHs_logFC_correlation_plot
+# saveRDS(PAHs_logFC_correlation_plot,"FigureS4b_PAHs_logFC_correlation_plot.rds")
+
+
+# tiff("~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/All_figures/FigureS4b_PAHs_counts_logFC_coef_correlation.tiff", units="in", width=5, height=5, res=300, compression = 'lzw') ## aspect ratio 1.6
+# PAHs_logFC_correlation_plot
+# dev.off()
+
+```
+
+#### PAHs top gene predictors function heatmap 
+```{r PAHs top gene predictors function heatmap, echo=FALSE, fig.width=5, fig.height=11}
+library(ComplexHeatmap)
+library(dendsort)
+
+PAHs_GOBP_data.matrix.t = t(PAHs_lasso_by_site_50_functional_data$heatmap_plot_data[-1,])
+PAHs_GOBP_data.matrix.t2 = PAHs_GOBP_data.matrix.t
+PAHs_GOBP_data.matrix.t2[PAHs_GOBP_data.matrix.t2 != 0] = 1
+ha = rowAnnotation(PAH.coef = anno_numeric(round(as.numeric(PAHs_lasso_by_site_50_functional_data$heatmap_plot_data["all",]), digits =2), bg_gp = gpar(fill = c("green", "red"))) , annotation_name_rot = 0)
+row_dend = dendsort(hclust(dist(PAHs_GOBP_data.matrix.t)))
+PAHs.H1 = Heatmap(PAHs_GOBP_data.matrix.t2, name = "Total PAHs - \n Lasso regression \n average coef.", column_names_gp = gpar(fontsize = 10), row_names_gp = gpar(fontsize = 11), column_title = "GO:BP", show_row_dend = FALSE, cluster_rows = row_dend, 
+                  col = c("white", "black"), rect_gp = gpar(col = "gray", lwd = 1),show_heatmap_legend = FALSE, right_annotation = ha )
+
+# saveRDS(PAHs_GOBP_data.matrix.t2, "~/Documents/work/Tswallow_chem_GLRI_update/GLRI_MS2_all/PAHs_GOBP_data.matrix.t2.rds")
+# Figure S3b
+PAHs.H1.v2 = Heatmap(PAHs_GOBP_data.matrix.t2, name = "Total PAHs - \n Lasso regression \n average coef.", column_names_gp = gpar(fontsize = 10), row_names_gp = gpar(fontsize = 11), column_title = "GO:BP", show_row_dend = FALSE, 
+                     row_order = order(as.numeric(PAHs_lasso_by_site_50_functional_data$heatmap_plot_data["all",])), col = c("white", "black"), rect_gp = gpar(col = "gray", lwd = 1),show_heatmap_legend = FALSE, right_annotation = ha )
+
+PAHs.H1.v2
+
+```
+
+### SessionInfo
+```{r sessionInfo}
+sessionInfo() 
+```
+
