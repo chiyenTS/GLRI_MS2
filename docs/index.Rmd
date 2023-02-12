@@ -23,3 +23,36 @@ Any use of trade, product, or firm names is for descriptive purposes only and do
 
 
 ![All the GLRI sampling sites](GLRI_site_map.png)  
+</br>
+
+![](https://d9-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/s3fs-public/styles/medium/public/springsummer2011_003.jpg?itok=s5voM6CA) ![](https://d9-wret.s3.us-west-2.amazonaws.com/assets/palladium/production/s3fs-public/styles/medium/public/thumbnails/image/DSC01717.JPG?itok=g6WbCIFP)
+</br>
+*Transcriptome was measured in the nestling livers and contaminant concentrations were measured in their carcasses.* 
+
+</br>
+
+```{r contaminants_pheatmap, fig.show="hold", out.width="50%", fig.height=11, echo=FALSE}
+library(pheatmap)
+contaminants_pheatmap <- readRDS("/home/chiyen/Documents/work/Tswallow_chem_GLRI_update/Update_chem_bioindicator_GLRI/contaminants_pheatmap.rds")
+contaminants_pheatmap
+altered_funcions_DEG_heatmap <- readRDS("Figure3aaltered_funcions_DEG_heatmap.rds")
+altered_funcions_DEG_heatmap
+```
+We developed a system to integrate transcriptomic responses with contaminant concentrations to determine and model the effects of PCBs, PAHs, PBDEs, or PFOS on Tree Swallow nestlings, amid a complex mixture of environmental contaminants. Exposures to PCBs or PFOS were associated with an upregulation of genes involving lipid metabolic processes, especially cholesterol biosynthesis. Exposures to PAHs or PBDEs were associated with a downregulation in genes involving in cell cycle regulation. An upregulation in immune response genes was also found in nestlings exposed to PBDEs.  
+
+</br>
+
+```{r remediation and site mixture prediction, fig.show="hold", out.width="50%", fig.height=8, echo=FALSE}
+model_site_regression_all <- readRDS("Fig_model_site_regression_all.rds")
+model_site_regression_all
+yyplot.bysite.remediation <- readRDS("Fig_yyplot.bysite.remediation.rds")
+yyplot.bysite.remediation
+```
+Lasso regression models were established to predict PCB or PAH concentrations. And the predicted and measured PCB concentration at Waukegan harbor were plotted by year, before and after remediation. 
+
+</br>
+
+#### These models can used to determine  
+* If biological effects can be explained by either PCB or PAH exposure   
+* If the predicted effect PCB concentrations after remediation attenuated with measured PCB concentrations.  
+
